@@ -2,18 +2,207 @@ import copy
 import functools
 import math
 from typing import Optional
+from functools import wraps
 
 import torch
 import torch.nn as nn
 from transformers.modeling_layers import (
     GradientCheckpointingLayer,
 )
-from transformers.modeling_rope_utils import dynamic_rope_update
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3PreTrainedModel,
     Gemma3TextConfig,
 )
+from transformers.utils import is_torch_npu_available, is_torch_xpu_available
+from transformers.utils.import_utils import is_torch_greater_or_equal
+
+
+def dynamic_rope_update(rope_forward):
+    """
+    Decorator function to update the RoPE parameters in the forward pass, if the model is using a dynamic RoPE
+    (i.e. a RoPE implementation that may recompute its frequencies in the forward pass).
+
+    Args:
+        rope_forward (Callable):
+            The forward pass of the RoPE implementation.
+
+    Returns:
+        The decorated forward pass.
+    """
+
+    def longrope_frequency_update(self, position_ids, device):
+        """Longrope uses long factor if sequence is larger than original pretraining length, short otherwise."""
+        seq_len = torch.max(position_ids) + 1
+        if hasattr(self.config, "original_max_position_embeddings"):
+            original_max_position_embeddings = (
+                self.config.original_max_position_embeddings
+            )
+        else:
+            original_max_position_embeddings = self.config.max_position_embeddings
+        if seq_len > original_max_position_embeddings:
+            if not hasattr(self, "long_inv_freq"):
+                self.long_inv_freq, _ = self.rope_init_fn(
+                    self.config, device, seq_len=original_max_position_embeddings + 1
+                )
+            self.register_buffer("inv_freq", self.long_inv_freq, persistent=False)
+        else:
+            # This .to() is needed if the model has been moved to a device after being initialized (because
+            # the buffer is automatically moved, but not the original copy)
+            self.original_inv_freq = self.original_inv_freq.to(device)
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+
+    def dynamic_frequency_update(self, position_ids, device):
+        """
+        dynamic RoPE layers should recompute `inv_freq` in the following situations:
+        1 - growing beyond the cached sequence length (allow scaling)
+        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
+        """
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:  # growth
+            inv_freq, self.attention_scaling = self.rope_init_fn(
+                self.config, device, seq_len=seq_len
+            )
+            self.register_buffer(
+                "inv_freq", inv_freq, persistent=False
+            )  # TODO joao: may break with compilation
+            self.max_seq_len_cached = seq_len
+
+        if (
+            seq_len < self.original_max_seq_len
+            and self.max_seq_len_cached > self.original_max_seq_len
+        ):  # reset
+            # This .to() is needed if the model has been moved to a device after being initialized (because
+            # the buffer is automatically moved, but not the original copy)
+            self.original_inv_freq = self.original_inv_freq.to(device)
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
+
+    @wraps(rope_forward)
+    def wrapper(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            dynamic_frequency_update(self, position_ids, device=x.device)
+        elif self.rope_type == "longrope":
+            longrope_frequency_update(self, position_ids, device=x.device)
+        return rope_forward(self, x, position_ids)
+
+    return wrapper
+
+
+_is_torch_greater_or_equal_than_2_5 = is_torch_greater_or_equal("2.5", accept_dev=True)
+_is_torch_greater_or_equal_than_2_8 = is_torch_greater_or_equal("2.8", accept_dev=True)
+_is_torch_xpu_available = is_torch_xpu_available()
+_is_torch_npu_available = is_torch_npu_available()
+
+
+def use_gqa_in_sdpa(attention_mask: Optional[torch.Tensor], key: torch.Tensor) -> bool:
+    # GQA can only be used under the following conditions
+    # 1.cuda
+    #   - torch version >= 2.5
+    #   - attention_mask is None (otherwise it will fall back to the math kernel)
+    #   - key is not a torch.fx.Proxy (otherwise it will fail with a tracing error)
+    # 2.xpu
+    #   - torch version >= 2.8
+    #   - key is not a torch.fx.Proxy (otherwise it will fail with a tracing error)
+    # 3.npu
+    #   - npu is not supported gqa currently
+    if _is_torch_xpu_available:
+        return _is_torch_greater_or_equal_than_2_8 and not isinstance(
+            key, torch.fx.Proxy
+        )
+    if _is_torch_npu_available:
+        return False
+    return (
+        _is_torch_greater_or_equal_than_2_5
+        and attention_mask is None
+        and not isinstance(key, torch.fx.Proxy)
+    )
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def sdpa_attention_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    is_causal: Optional[bool] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
+        print(
+            "`sdpa` attention does not support `output_attentions=True` or `head_mask`."
+            " Please set your attention to `eager` if you want any of these features."
+        )
+    sdpa_kwargs = {}
+    if hasattr(module, "num_key_value_groups"):
+        if not use_gqa_in_sdpa(attention_mask, key):
+            key = repeat_kv(key, module.num_key_value_groups)
+            value = repeat_kv(value, module.num_key_value_groups)
+        else:
+            sdpa_kwargs = {"enable_gqa": True}
+
+    if attention_mask is not None and attention_mask.ndim == 4:
+        attention_mask = attention_mask[:, :, :, : key.shape[-2]]
+
+    # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+    # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+    # Note that it is important to check first for the shape, otherwise compile will fail with `argument 'is_causal' must be bool, not SymBool`
+    if is_causal is None:
+        # The last condition is for encoder (decoder) models which specify this by passing their own `is_causal` flag
+        # This is mainly due to those models having mixed implementations for encoder, decoder, and encoder-decoder attns
+        is_causal = (
+            query.shape[2] > 1
+            and attention_mask is None
+            and getattr(module, "is_causal", True)
+        )
+
+    # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
+    # We convert it to a bool for the SDPA kernel that only accepts bools.
+    if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor):
+        is_causal = is_causal.item()
+
+    # When `is_causal = False` and the `attention_mask` is not of boolean type, the Ascend NPU's SDPA interface cannot utilize the FlashAttentionScore operator，
+    # and falls back to small-operator concatenation. To invoke the FlashAttentionScore, the attention_mask must be converted to boolean type.
+    # This adaptation ensures the `attention_mask` meets the requirement for using FlashAttentionScore.
+    if _is_torch_npu_available:
+        if attention_mask is not None and attention_mask.dtype != torch.bool:
+            # Convert to boolean type, making sdpa to force call FlashAttentionScore to improve performance.
+            attention_mask = torch.logical_not(attention_mask.bool()).to(query.device)
+
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=dropout,
+        scale=scaling,
+        is_causal=is_causal,
+        **sdpa_kwargs,
+    )
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, None
+
+
+ALL_ATTENTION_FUNCTIONS = {
+    "sdpa": sdpa_attention_forward,
+}
 
 
 def _compute_default_rope_parameters(
@@ -328,7 +517,6 @@ class Gemma3Attention(nn.Module):
         )
 
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -524,6 +712,7 @@ if __name__ == "__main__":
     tokenizer = transformers.AutoTokenizer.from_pretrained("google/gemma-3-270m")
     config = Gemma3TextConfig.from_pretrained("google/gemma-3-270m")
     print(config)
+    print(config._attn_implementation)
     model = Gemma3ForCausalLM(config)
     weight_path = hf_hub_download(
         repo_id="google/gemma-3-270m", filename="model.safetensors"
