@@ -8,12 +8,43 @@ import torch.nn as nn
 from transformers.modeling_layers import (
     GradientCheckpointingLayer,
 )
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.modeling_rope_utils import dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3PreTrainedModel,
     Gemma3TextConfig,
 )
+
+
+def _compute_default_rope_parameters(
+    config: Optional[Gemma3TextConfig] = None,
+    device: Optional["torch.device"] = None,
+    seq_len: Optional[int] = None,
+) -> tuple["torch.Tensor", float]:
+    base = config.rope_theta
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+    head_dim = (
+        getattr(config, "head_dim", None)
+        or config.hidden_size // config.num_attention_heads
+    )
+    dim = int(head_dim * partial_rotary_factor)
+
+    attention_factor = 1.0  # Unused in this type of RoPE
+
+    # Compute the inverse frequencies
+    inv_freq = 1.0 / (
+        base
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.int64).to(
+                device=device, dtype=torch.float
+            )
+            / dim
+        )
+    )
+    return inv_freq, attention_factor
+
+
+ROPE_INIT_FUNCTIONS = {"default": _compute_default_rope_parameters}
 
 
 class GELUTanh(nn.Module):
