@@ -20,7 +20,6 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3PreTrainedModel,
     Gemma3TextConfig,
-    _bidirectional_window_overlay,
     apply_rotary_pos_emb,
     eager_attention_forward,
 )
@@ -183,8 +182,6 @@ class Gemma3Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
@@ -201,13 +198,6 @@ class Gemma3Attention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin
         )
-
-        if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -263,9 +253,7 @@ class Gemma3DecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> tuple[
-        torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
-    ]:
+    ) -> torch.Tensor:
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -295,7 +283,7 @@ class Gemma3DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        outputs = hidden_states
 
         return outputs
 
@@ -362,18 +350,9 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             "past_key_values": None,
             "position_ids": position_ids,
         }
-        sliding_mask_kwargs = mask_kwargs.copy()
-
-        if self.config.use_bidirectional_attention:
-            mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(
-                True, dtype=torch.bool
-            )
-            sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(
-                self.config.sliding_window
-            )
 
         full_attn_mask = create_causal_mask(**mask_kwargs)
-        sliding_attn_mask = create_sliding_window_causal_mask(**sliding_mask_kwargs)
+        sliding_attn_mask = create_sliding_window_causal_mask(**mask_kwargs)
 
         # embed positions
         hidden_states = inputs_embeds
@@ -395,11 +374,9 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
                 position_embeddings_local=position_embeddings_local,
                 attention_mask=current_mask,
                 position_ids=position_ids,
-                past_key_values=None,
-                cache_position=cache_position,
                 **kwargs,
             )
-            hidden_states = layer_outputs[0]
+            hidden_states = layer_outputs
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
