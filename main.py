@@ -5,13 +5,10 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache
-from transformers.generation import GenerationMixin
 from transformers.masking_utils import (
     create_causal_mask,
     create_sliding_window_causal_mask,
 )
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
     GradientCheckpointingLayer,
 )
@@ -22,10 +19,6 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3TextConfig,
     apply_rotary_pos_emb,
     eager_attention_forward,
-)
-from transformers.processing_utils import Unpack
-from transformers.utils import (
-    TransformersKwargs,
 )
 
 
@@ -182,7 +175,6 @@ class Gemma3Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
-        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -214,7 +206,6 @@ class Gemma3Attention(nn.Module):
             dropout=self.attention_dropout if self.training else 0.0,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -249,10 +240,6 @@ class Gemma3DecoderLayer(GradientCheckpointingLayer):
         position_embeddings_local: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -268,11 +255,6 @@ class Gemma3DecoderLayer(GradientCheckpointingLayer):
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
@@ -331,7 +313,6 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         inputs_embeds = self.embed_tokens(input_ids)
 
@@ -374,7 +355,6 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
                 position_embeddings_local=position_embeddings_local,
                 attention_mask=current_mask,
                 position_ids=position_ids,
-                **kwargs,
             )
             hidden_states = layer_outputs
 
@@ -382,7 +362,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
         return hidden_states
 
 
-class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
+class Gemma3ForCausalLM(Gemma3PreTrainedModel):
     def __init__(self, config: Gemma3TextConfig):
         super().__init__(config)
         self.model = Gemma3TextModel(config)
@@ -396,13 +376,11 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        **kwargs,
     ) -> torch.Tensor:
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs: torch.Tensor = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            **kwargs,
         )
         logits = self.lm_head(outputs)
         return logits
