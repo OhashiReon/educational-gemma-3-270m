@@ -1,13 +1,10 @@
 import copy
+import functools
+import math
 from typing import Optional
 
 import torch
 import torch.nn as nn
-from transformers.activations import ACT2FN
-from transformers.masking_utils import (
-    create_causal_mask,
-    create_sliding_window_causal_mask,
-)
 from transformers.modeling_layers import (
     GradientCheckpointingLayer,
 )
@@ -17,6 +14,97 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3PreTrainedModel,
     Gemma3TextConfig,
 )
+
+
+class GELUTanh(nn.Module):
+    """
+    A fast C implementation of the tanh approximation of the GeLU activation function. See
+    https://huggingface.co/papers/1606.08415.
+
+    This implementation is equivalent to NewGELU and FastGELU but much faster. However, it is not an exact numerical
+    match due to rounding errors.
+    """
+
+    def __init__(self, use_gelu_tanh_python: bool = False):
+        super().__init__()
+        if use_gelu_tanh_python:
+            self.act = self._gelu_tanh_python
+        else:
+            self.act = functools.partial(nn.functional.gelu, approximate="tanh")
+
+    def _gelu_tanh_python(self, input: torch.Tensor) -> torch.Tensor:
+        return (
+            input
+            * 0.5
+            * (
+                1.0
+                + torch.tanh(
+                    math.sqrt(2.0 / math.pi)
+                    * (input + 0.044715 * torch.pow(input, 3.0))
+                )
+            )
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return self.act(input)
+
+
+ACT2FN = {
+    "gelu_pytorch_tanh": GELUTanh,
+}
+
+
+def create_causal_mask(
+    config: Gemma3TextConfig,
+    input_embeds: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    cache_position: torch.Tensor,
+) -> torch.Tensor:
+    batch_size, query_length, _ = input_embeds.shape
+    device = input_embeds.device
+    dtype = input_embeds.dtype
+    past_length = 0
+    key_length = past_length + query_length
+    query_pos = cache_position.view(query_length, 1)
+    key_pos = torch.arange(key_length, device=device).view(1, key_length)
+    mask = torch.zeros((query_length, key_length), device=device, dtype=dtype)
+    mask.masked_fill_(key_pos > query_pos, torch.finfo(dtype).min)
+    mask = mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+    if attention_mask is not None:
+        padding_mask = torch.zeros_like(attention_mask, dtype=dtype)
+        padding_mask.masked_fill_(attention_mask == 0, torch.finfo(dtype).min)
+        padding_mask = padding_mask.unsqueeze(1).unsqueeze(1)
+        mask = mask + padding_mask
+    return mask
+
+
+def create_sliding_window_causal_mask(
+    config: Gemma3TextConfig,
+    input_embeds: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    cache_position: torch.Tensor,
+) -> torch.Tensor:
+    causal_mask = create_causal_mask(
+        config, input_embeds, attention_mask, cache_position
+    )
+    sliding_window = getattr(config, "sliding_window", None)
+    if sliding_window is None:
+        raise ValueError(
+            "Config must have `sliding_window` for sliding window attention."
+        )
+    batch_size, query_length, _ = input_embeds.shape
+    device = input_embeds.device
+    dtype = input_embeds.dtype
+    past_length = 0
+    key_length = past_length + query_length
+    query_pos = cache_position.view(query_length, 1)
+    key_pos = torch.arange(key_length, device=device).view(1, key_length)
+    dist = query_pos - key_pos
+    window_mask = torch.zeros((query_length, key_length), device=device, dtype=dtype)
+    window_mask.masked_fill_(dist > sliding_window, torch.finfo(dtype).min)
+    window_mask = window_mask.unsqueeze(0).unsqueeze(0)
+    combined_mask = causal_mask + window_mask
+    return combined_mask
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
@@ -135,7 +223,8 @@ class Gemma3MLP(nn.Module):
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_activation]
+        # Instantiate the activation module; mapping stores a class, not a callable.
+        self.act_fn = ACT2FN[config.hidden_activation]()
 
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -340,8 +429,6 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             "input_embeds": inputs_embeds,
             "attention_mask": attention_mask,
             "cache_position": cache_position,
-            "past_key_values": None,
-            "position_ids": position_ids,
         }
 
         full_attn_mask = create_causal_mask(**mask_kwargs)
