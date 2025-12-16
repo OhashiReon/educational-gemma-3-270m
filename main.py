@@ -1,5 +1,4 @@
 import copy
-from collections.abc import Callable
 from typing import Optional
 
 import torch
@@ -17,9 +16,26 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3PreTrainedModel,
     Gemma3TextConfig,
-    apply_rotary_pos_emb,
-    eager_attention_forward,
 )
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """
+    q, k: [batch, heads, seq_len, head_dim]
+    cos, sin: [batch, seq_len, head_dim] or [1, seq_len, head_dim]
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
 class Gemma3TextScaledWordEmbedding(nn.Embedding):
@@ -191,11 +207,7 @@ class Gemma3Attention(nn.Module):
             query_states, key_states, cos, sin
         )
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation
-            ]
+        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -393,6 +405,7 @@ if __name__ == "__main__":
 
     tokenizer = transformers.AutoTokenizer.from_pretrained("google/gemma-3-270m")
     config = Gemma3TextConfig.from_pretrained("google/gemma-3-270m")
+    print(config)
     model = Gemma3ForCausalLM(config)
     weight_path = hf_hub_download(
         repo_id="google/gemma-3-270m", filename="model.safetensors"
