@@ -15,10 +15,6 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import (
     GradientCheckpointingLayer,
 )
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-)
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.gemma3.modeling_gemma3 import (
@@ -26,15 +22,12 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3TextConfig,
     _bidirectional_window_overlay,
     apply_rotary_pos_emb,
-    check_model_inputs,
     eager_attention_forward,
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import (
     TransformersKwargs,
-    can_return_tuple,
 )
-from transformers.utils.deprecation import deprecate_kwarg
 
 
 class Gemma3TextScaledWordEmbedding(nn.Embedding):
@@ -185,7 +178,6 @@ class Gemma3Attention(nn.Module):
         self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
 
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -260,7 +252,6 @@ class Gemma3DecoderLayer(GradientCheckpointingLayer):
             self.hidden_size, eps=config.rms_norm_eps
         )
 
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -269,7 +260,6 @@ class Gemma3DecoderLayer(GradientCheckpointingLayer):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
@@ -292,7 +282,6 @@ class Gemma3DecoderLayer(GradientCheckpointingLayer):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
             **kwargs,
@@ -307,9 +296,6 @@ class Gemma3DecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (self_attn_weights,)
 
         return outputs
 
@@ -353,16 +339,12 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs()
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPast:
-        all_self_attns = ()
-        all_hidden_states = ()
-
+    ) -> torch.Tensor:
         inputs_embeds = self.embed_tokens(input_ids)
 
         cache_position = torch.arange(
@@ -402,7 +384,6 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
 
         # decoder layers
         for decoder_layer in self.layers:
-            all_hidden_states += (hidden_states,)
             if decoder_layer.attention_type == "sliding_attention":
                 current_mask = sliding_attn_mask
             else:
@@ -415,23 +396,13 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
                 attention_mask=current_mask,
                 position_ids=position_ids,
                 past_key_values=None,
-                output_attentions=True,
-                # use_cache=None,
                 cache_position=cache_position,
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
-            all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
-        all_hidden_states += (hidden_states,)
-
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=None,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-        )
+        return hidden_states
 
 
 class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
@@ -444,29 +415,20 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @can_return_tuple
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> CausalLMOutputWithPast:
+    ) -> torch.Tensor:
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs: BaseModelOutputWithPast = self.model(
+        outputs: torch.Tensor = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             **kwargs,
         )
-        logits = self.lm_head(outputs.last_hidden_state)
-        loss = None
-
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+        logits = self.lm_head(outputs)
+        return logits
 
 
 if __name__ == "__main__":
@@ -485,7 +447,7 @@ if __name__ == "__main__":
     model.tie_weights()
     text = "Hello, my dog is cute"
     for _ in range(20):
-        out = model.forward(**tokenizer(text, return_tensors="pt"))
-        ids = out.logits.argmax(-1)
+        logits = model.forward(**tokenizer(text, return_tensors="pt"))
+        ids = logits.argmax(-1)
         text = text + tokenizer.decode(ids[0, -1].unsqueeze(0))
         print(text)
