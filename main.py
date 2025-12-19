@@ -9,14 +9,6 @@ import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
 
-from transformers.utils import is_torch_npu_available, is_torch_xpu_available
-from transformers.utils.import_utils import is_torch_greater_or_equal
-
-_is_torch_greater_or_equal_than_2_5 = is_torch_greater_or_equal("2.5", accept_dev=True)
-_is_torch_greater_or_equal_than_2_8 = is_torch_greater_or_equal("2.8", accept_dev=True)
-_is_torch_xpu_available = is_torch_xpu_available()
-_is_torch_npu_available = is_torch_npu_available()
-
 
 @dataclass
 class Gemma3TextConfig:
@@ -133,116 +125,6 @@ class Gemma3PreTrainedModel(nn.Module):
 
         if output_embeddings is not None and input_embeddings is not None:
             output_embeddings.weight = input_embeddings.weight
-
-
-def use_gqa_in_sdpa(attention_mask: Optional[torch.Tensor], key: torch.Tensor) -> bool:
-    # GQA can only be used under the following conditions
-    # 1.cuda
-    #   - torch version >= 2.5
-    #   - attention_mask is None (otherwise it will fall back to the math kernel)
-    #   - key is not a torch.fx.Proxy (otherwise it will fail with a tracing error)
-    # 2.xpu
-    #   - torch version >= 2.8
-    #   - key is not a torch.fx.Proxy (otherwise it will fail with a tracing error)
-    # 3.npu
-    #   - npu is not supported gqa currently
-    if _is_torch_xpu_available:
-        return _is_torch_greater_or_equal_than_2_8 and not isinstance(
-            key, torch.fx.Proxy
-        )
-    if _is_torch_npu_available:
-        return False
-    return (
-        _is_torch_greater_or_equal_than_2_5
-        and attention_mask is None
-        and not isinstance(key, torch.fx.Proxy)
-    )
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-
-def sdpa_attention_forward(
-    module: torch.nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    dropout: float = 0.0,
-    scaling: Optional[float] = None,
-    is_causal: Optional[bool] = None,
-    **kwargs,
-) -> tuple[torch.Tensor, None]:
-    if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
-        print(
-            "`sdpa` attention does not support `output_attentions=True` or `head_mask`."
-            " Please set your attention to `eager` if you want any of these features."
-        )
-    sdpa_kwargs = {}
-    if hasattr(module, "num_key_value_groups"):
-        if not use_gqa_in_sdpa(attention_mask, key):
-            key = repeat_kv(key, module.num_key_value_groups)
-            value = repeat_kv(value, module.num_key_value_groups)
-        else:
-            sdpa_kwargs = {"enable_gqa": True}
-
-    if attention_mask is not None and attention_mask.ndim == 4:
-        attention_mask = attention_mask[:, :, :, : key.shape[-2]]
-
-    # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
-    # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-    # Note that it is important to check first for the shape, otherwise compile will fail with `argument 'is_causal' must be bool, not SymBool`
-    if is_causal is None:
-        # The last condition is for encoder (decoder) models which specify this by passing their own `is_causal` flag
-        # This is mainly due to those models having mixed implementations for encoder, decoder, and encoder-decoder attns
-        is_causal = (
-            query.shape[2] > 1
-            and attention_mask is None
-            and getattr(module, "is_causal", True)
-        )
-
-    # Shapes (e.g. query.shape[2]) are tensors during jit tracing, resulting in `is_causal` being a tensor.
-    # We convert it to a bool for the SDPA kernel that only accepts bools.
-    if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor):
-        is_causal = is_causal.item()
-
-    # When `is_causal = False` and the `attention_mask` is not of boolean type, the Ascend NPU's SDPA interface cannot utilize the FlashAttentionScore operator，
-    # and falls back to small-operator concatenation. To invoke the FlashAttentionScore, the attention_mask must be converted to boolean type.
-    # This adaptation ensures the `attention_mask` meets the requirement for using FlashAttentionScore.
-    if _is_torch_npu_available:
-        if attention_mask is not None and attention_mask.dtype != torch.bool:
-            # Convert to boolean type, making sdpa to force call FlashAttentionScore to improve performance.
-            attention_mask = torch.logical_not(attention_mask.bool()).to(query.device)
-
-    attn_output = torch.nn.functional.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        attn_mask=attention_mask,
-        dropout_p=dropout,
-        scale=scaling,
-        is_causal=is_causal,
-        **sdpa_kwargs,
-    )
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, None
-
-
-ALL_ATTENTION_FUNCTIONS = {
-    "sdpa": sdpa_attention_forward,
-}
 
 
 def _compute_default_rope_parameters(
@@ -606,13 +488,17 @@ class Gemma3Attention(nn.Module):
             query_states, key_states, cos, sin
         )
 
+        # TODO: eager attention implementations
+        ALL_ATTENTION_FUNCTIONS = {
+            "sdpa": self.sdpa_attention_forward,
+        }
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         attn_output, attn_weights = attention_interface(
-            self,
             query_states,
             key_states,
             value_states,
             attention_mask,
+            is_causal=self.is_causal,
             dropout=self.attention_dropout if self.training else 0.0,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
@@ -621,6 +507,49 @@ class Gemma3Attention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+
+    def sdpa_attention_forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        dropout: float = 0.0,
+        scaling: Optional[float] = None,
+        is_causal: Optional[bool] = None,
+        sliding_window: Optional[int] = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, None]:
+        key = self.repeat_kv(key, self.num_key_value_groups)
+        value = self.repeat_kv(value, self.num_key_value_groups)
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=dropout,
+            scale=scaling,
+            is_causal=is_causal,
+            enable_gqa=True,
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        return attn_output, None
+
+    @staticmethod
+    def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+        num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+        """
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, None, :, :].expand(
+            batch, num_key_value_heads, n_rep, slen, head_dim
+        )
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 class Gemma3DecoderLayer(nn.Module):
