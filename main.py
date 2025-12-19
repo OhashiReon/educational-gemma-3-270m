@@ -12,7 +12,6 @@ from huggingface_hub import hf_hub_download
 
 @dataclass
 class Gemma3TextConfig:
-    # --- JSONに存在するパラメータ ---
     vocab_size: int
     hidden_size: int
     intermediate_size: int
@@ -38,18 +37,14 @@ class Gemma3TextConfig:
     pad_token_id: int
 
     initializer_range: float
-    # 前回のWarningに含まれていたため追加 (JSONに存在するため)
     use_bidirectional_attention: bool
 
-    # --- JSONでは null の可能性があるもの ---
     attention_bias: bool
     attention_dropout: float
     attn_logit_softcapping: Optional[float]
     final_logit_softcapping: Optional[float]
     rope_scaling: Optional[dict]
 
-    # --- JSONにはないが、モデルの動作に必要なパラメータ ---
-    # transformersでは実行時に動的追加されるもの。ここで明示的に定義します。
     _attn_implementation: str
 
     @classmethod
@@ -58,22 +53,13 @@ class Gemma3TextConfig:
     ) -> "Gemma3TextConfig":
         """
         config.json を読み込み、attn_implementation を注入してクラスを作成します。
-
-        Args:
-            repo_id: Hugging FaceのモデルID
-            attn_implementation: アテンションの実装方法。
-                                 "eager" (通常のPyTorch), "sdpa" (torch.nn.functional.scaled_dot_product_attention),
-                                 "flash_attention_2" など。初学者は "eager" か "sdpa" 推奨。
         """
         config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
 
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # JSONデータに存在しない必須パラメータをここで手動追加します
         data["_attn_implementation"] = attn_implementation
-
-        # クラス定義にあるキーだけを抽出 (メタデータ除去)
         valid_keys = cls.__annotations__.keys()
         filtered_data = {k: v for k, v in data.items() if k in valid_keys}
 
@@ -85,8 +71,6 @@ class Gemma3PreTrainedModel(nn.Module):
     transformers.PreTrainedModel の代わりとなる、
     依存関係を排除した最小限のベースクラス。
     """
-
-    config_class = Gemma3TextConfig  # クラス変数はなくても動きますが、念のため
 
     def __init__(self, config: Gemma3TextConfig):
         super().__init__()
@@ -119,7 +103,6 @@ class Gemma3PreTrainedModel(nn.Module):
         """
         入力埋め込みと出力層の重みを共有する場合の処理。
         """
-        # 実装によっては output_embeddings が存在しない場合もあるため getattr でガード
         output_embeddings = getattr(self, "lm_head", None)
         input_embeddings = getattr(self.model, "embed_tokens", None)
 
