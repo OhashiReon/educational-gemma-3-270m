@@ -1,15 +1,14 @@
 import copy
 import functools
+import json
 import math
-from typing import Optional
+from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
+from huggingface_hub import hf_hub_download
 
-from transformers.models.gemma3.modeling_gemma3 import (
-    Gemma3PreTrainedModel,
-    Gemma3TextConfig,
-)
 from transformers.utils import is_torch_npu_available, is_torch_xpu_available
 from transformers.utils.import_utils import is_torch_greater_or_equal
 
@@ -17,6 +16,123 @@ _is_torch_greater_or_equal_than_2_5 = is_torch_greater_or_equal("2.5", accept_de
 _is_torch_greater_or_equal_than_2_8 = is_torch_greater_or_equal("2.8", accept_dev=True)
 _is_torch_xpu_available = is_torch_xpu_available()
 _is_torch_npu_available = is_torch_npu_available()
+
+
+@dataclass
+class Gemma3TextConfig:
+    # --- JSONに存在するパラメータ ---
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    max_position_embeddings: int
+
+    layer_types: List[str]
+    hidden_activation: str
+    rms_norm_eps: float
+    use_cache: bool
+
+    query_pre_attn_scalar: int
+    sliding_window: int
+    _sliding_window_pattern: int
+    rope_theta: float
+    rope_local_base_freq: float
+
+    bos_token_id: int
+    eos_token_id: int
+    pad_token_id: int
+
+    initializer_range: float
+    # 前回のWarningに含まれていたため追加 (JSONに存在するため)
+    use_bidirectional_attention: bool
+
+    # --- JSONでは null の可能性があるもの ---
+    attention_bias: bool
+    attention_dropout: float
+    attn_logit_softcapping: Optional[float]
+    final_logit_softcapping: Optional[float]
+    rope_scaling: Optional[dict]
+
+    # --- JSONにはないが、モデルの動作に必要なパラメータ ---
+    # transformersでは実行時に動的追加されるもの。ここで明示的に定義します。
+    _attn_implementation: str
+
+    @classmethod
+    def from_pretrained(
+        cls, repo_id: str, attn_implementation: str = "sdpa"
+    ) -> "Gemma3TextConfig":
+        """
+        config.json を読み込み、attn_implementation を注入してクラスを作成します。
+
+        Args:
+            repo_id: Hugging FaceのモデルID
+            attn_implementation: アテンションの実装方法。
+                                 "eager" (通常のPyTorch), "sdpa" (torch.nn.functional.scaled_dot_product_attention),
+                                 "flash_attention_2" など。初学者は "eager" か "sdpa" 推奨。
+        """
+        config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # JSONデータに存在しない必須パラメータをここで手動追加します
+        data["_attn_implementation"] = attn_implementation
+
+        # クラス定義にあるキーだけを抽出 (メタデータ除去)
+        valid_keys = cls.__annotations__.keys()
+        filtered_data = {k: v for k, v in data.items() if k in valid_keys}
+
+        return cls(**filtered_data)
+
+
+class Gemma3PreTrainedModel(nn.Module):
+    """
+    transformers.PreTrainedModel の代わりとなる、
+    依存関係を排除した最小限のベースクラス。
+    """
+
+    config_class = Gemma3TextConfig  # クラス変数はなくても動きますが、念のため
+
+    def __init__(self, config: Gemma3TextConfig):
+        super().__init__()
+        self.config = config
+
+    def _init_weights(self, module):
+        """
+        Gemmaモデルの標準的な初期化ロジック。
+        transformersのソースコードから、Gemmaに必要な部分のみを抽出・再現。
+        """
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+
+    def post_init(self):
+        """
+        __init__ の最後に呼び出して、全パラメータを初期化する。
+        ロード済みの重みを上書きしないよう、学習前の初期化時のみ重要になりますが、
+        load_state_dictする前段階の整合性として必要です。
+        """
+        self.apply(self._init_weights)
+
+    def tie_weights(self):
+        """
+        入力埋め込みと出力層の重みを共有する場合の処理。
+        """
+        # 実装によっては output_embeddings が存在しない場合もあるため getattr でガード
+        output_embeddings = getattr(self, "lm_head", None)
+        input_embeddings = getattr(self.model, "embed_tokens", None)
+
+        if output_embeddings is not None and input_embeddings is not None:
+            output_embeddings.weight = input_embeddings.weight
 
 
 def use_gqa_in_sdpa(attention_mask: Optional[torch.Tensor], key: torch.Tensor) -> bool:
