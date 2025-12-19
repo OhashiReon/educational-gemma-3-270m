@@ -240,131 +240,43 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
 
 
 class Gemma3RotaryEmbedding(nn.Module):
-    inv_freq: torch.Tensor  # fix linting for `register_buffer`
-
     def __init__(self, config: Gemma3TextConfig, device=None):
         super().__init__()
-        # BC: "rope_type" was originally "type"
-        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type")
+        self.dim = config.head_dim
+        self.max_position_embeddings = config.max_position_embeddings
+        self.base = config.rope_theta
+        inv_freq = 1.0 / (
+            self.base
+            ** (
+                torch.arange(0, self.dim, 2, dtype=torch.int64).to(device=device)
+                / self.dim
             )
-        else:
-            self.rope_type = "default"
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-
-        self.config = config
-        ROPE_INIT_FUNCTIONS = {"default": self._compute_default_rope_parameters}
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
+        self._set_cos_sin_cache(
+            seq_len=self.max_position_embeddings,
+            device=device,
+            dtype=torch.float32,
+        )
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
     @torch.no_grad()
     def forward(self, x, position_ids):
-        if "dynamic" in self.rope_type:
-            self._dynamic_frequency_update(position_ids, device=x.device)
-        elif self.rope_type == "longrope":
-            self._longrope_frequency_update(position_ids, device=x.device)
-        inv_freq_expanded = (
-            self.inv_freq[None, :, None]
-            .float()
-            .expand(position_ids.shape[0], -1, 1)
-            .to(x.device)
-        )
-        position_ids_expanded = position_ids[:, None, :].float()
-
-        device_type = (
-            x.device.type
-            if isinstance(x.device.type, str) and x.device.type != "mps"
-            else "cpu"
-        )
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (
-                inv_freq_expanded.float() @ position_ids_expanded.float()
-            ).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * self.attention_scaling
-            sin = emb.sin() * self.attention_scaling
-
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-    def _longrope_frequency_update(self, position_ids, device):
-        """Longrope uses long factor if sequence is larger than original pretraining length, short otherwise."""
-        seq_len = torch.max(position_ids) + 1
-        if hasattr(self.config, "original_max_position_embeddings"):
-            original_max_position_embeddings = (
-                self.config.original_max_position_embeddings
-            )
+        seq_len = x.shape[1]
+        if position_ids is None:
+            cos = self.cos_cached[:seq_len].unsqueeze(0)
+            sin = self.sin_cached[:seq_len].unsqueeze(0)
         else:
-            original_max_position_embeddings = self.config.max_position_embeddings
-        if seq_len > original_max_position_embeddings:
-            if not hasattr(self, "long_inv_freq"):
-                self.long_inv_freq, _ = self.rope_init_fn(
-                    self.config, device, seq_len=original_max_position_embeddings + 1
-                )
-            self.register_buffer("inv_freq", self.long_inv_freq, persistent=False)
-        else:
-            # This .to() is needed if the model has been moved to a device after being initialized (because
-            # the buffer is automatically moved, but not the original copy)
-            self.original_inv_freq = self.original_inv_freq.to(device)
-            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
-
-    def _dynamic_frequency_update(self, position_ids, device):
-        """
-        dynamic RoPE layers should recompute `inv_freq` in the following situations:
-        1 - growing beyond the cached sequence length (allow scaling)
-        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
-        """
-        seq_len = torch.max(position_ids) + 1
-        if seq_len > self.max_seq_len_cached:  # growth
-            inv_freq, self.attention_scaling = self.rope_init_fn(
-                self.config, device, seq_len=seq_len
-            )
-            self.register_buffer(
-                "inv_freq", inv_freq, persistent=False
-            )  # TODO joao: may break with compilation
-            self.max_seq_len_cached = seq_len
-
-        if (
-            seq_len < self.original_max_seq_len
-            and self.max_seq_len_cached > self.original_max_seq_len
-        ):  # reset
-            # This .to() is needed if the model has been moved to a device after being initialized (because
-            # the buffer is automatically moved, but not the original copy)
-            self.original_inv_freq = self.original_inv_freq.to(device)
-            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
-            self.max_seq_len_cached = self.original_max_seq_len
-
-    @staticmethod
-    def _compute_default_rope_parameters(
-        config: Optional[Gemma3TextConfig] = None,
-        device: Optional["torch.device"] = None,
-        seq_len: Optional[int] = None,
-    ) -> tuple["torch.Tensor", float]:
-        base = config.rope_theta
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-        head_dim = (
-            getattr(config, "head_dim", None)
-            or config.hidden_size // config.num_attention_heads
-        )
-        dim = int(head_dim * partial_rotary_factor)
-
-        attention_factor = 1.0  # Unused in this type of RoPE
-
-        # Compute the inverse frequencies
-        inv_freq = 1.0 / (
-            base
-            ** (
-                torch.arange(0, dim, 2, dtype=torch.int64).to(
-                    device=device, dtype=torch.float
-                )
-                / dim
-            )
-        )
-        return inv_freq, attention_factor
+            cos = self.cos_cached[position_ids]
+            sin = self.sin_cached[position_ids]
+        return cos, sin
 
 
 class Gemma3RMSNorm(nn.Module):
