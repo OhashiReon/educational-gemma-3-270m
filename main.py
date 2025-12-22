@@ -110,41 +110,8 @@ class Gemma3PreTrainedModel(nn.Module):
             output_embeddings.weight = input_embeddings.weight
 
 
-class GELUTanh(nn.Module):
-    """
-    A fast C implementation of the tanh approximation of the GeLU activation function. See
-    https://huggingface.co/papers/1606.08415.
-
-    This implementation is equivalent to NewGELU and FastGELU but much faster. However, it is not an exact numerical
-    match due to rounding errors.
-    """
-
-    def __init__(self, use_gelu_tanh_python: bool = False):
-        super().__init__()
-        if use_gelu_tanh_python:
-            self.act = self._gelu_tanh_python
-        else:
-            self.act = functools.partial(nn.functional.gelu, approximate="tanh")
-
-    def _gelu_tanh_python(self, input: torch.Tensor) -> torch.Tensor:
-        return (
-            input
-            * 0.5
-            * (
-                1.0
-                + torch.tanh(
-                    math.sqrt(2.0 / math.pi)
-                    * (input + 0.044715 * torch.pow(input, 3.0))
-                )
-            )
-        )
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return self.act(input)
-
-
 ACT2FN = {
-    "gelu_pytorch_tanh": GELUTanh,
+    "gelu_pytorch_tanh": functools.partial(nn.functional.gelu, approximate="tanh"),
 }
 
 
@@ -284,8 +251,7 @@ class Gemma3MLP(nn.Module):
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        # Instantiate the activation module; mapping stores a class, not a callable.
-        self.act_fn = ACT2FN[config.hidden_activation]()
+        self.act_fn = ACT2FN[config.hidden_activation]
 
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
