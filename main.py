@@ -148,57 +148,33 @@ ACT2FN = {
 }
 
 
-def create_causal_mask(
-    config: Gemma3TextConfig,
+def create_attention_mask(
+    *,
     input_embeds: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
     cache_position: torch.Tensor,
+    sliding_window: Optional[int] = None,
 ) -> torch.Tensor:
-    batch_size, query_length, _ = input_embeds.shape
+    """
+    Returns attention mask of shape (B, 1, Q, K)
+    """
+    B, Q, _ = input_embeds.shape
     device = input_embeds.device
     dtype = input_embeds.dtype
-    past_length = 0
-    key_length = past_length + query_length
-    query_pos = cache_position.view(query_length, 1)
-    key_pos = torch.arange(key_length, device=device).view(1, key_length)
-    mask = torch.zeros((query_length, key_length), device=device, dtype=dtype)
-    mask.masked_fill_(key_pos > query_pos, torch.finfo(dtype).min)
-    mask = mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+    K = Q
+    neg_inf = torch.finfo(dtype).min
+    q_pos = cache_position.view(Q, 1)
+    k_pos = torch.arange(K, device=device).view(1, K)
+    mask = torch.zeros((Q, K), device=device, dtype=dtype)
+    mask.masked_fill_(k_pos > q_pos, neg_inf)
+    if sliding_window is not None:
+        too_far = (q_pos - k_pos) > sliding_window
+        mask.masked_fill_(too_far, neg_inf)
+    mask = mask.unsqueeze(0).unsqueeze(0).expand(B, 1, Q, K)
     if attention_mask is not None:
-        padding_mask = torch.zeros_like(attention_mask, dtype=dtype)
-        padding_mask.masked_fill_(attention_mask == 0, torch.finfo(dtype).min)
-        padding_mask = padding_mask.unsqueeze(1).unsqueeze(1)
-        mask = mask + padding_mask
+        pad = (attention_mask == 0).to(dtype) * neg_inf
+        mask = mask + pad[:, None, None, :]
     return mask
-
-
-def create_sliding_window_causal_mask(
-    config: Gemma3TextConfig,
-    input_embeds: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    cache_position: torch.Tensor,
-) -> torch.Tensor:
-    causal_mask = create_causal_mask(
-        config, input_embeds, attention_mask, cache_position
-    )
-    sliding_window = getattr(config, "sliding_window", None)
-    if sliding_window is None:
-        raise ValueError(
-            "Config must have `sliding_window` for sliding window attention."
-        )
-    batch_size, query_length, _ = input_embeds.shape
-    device = input_embeds.device
-    dtype = input_embeds.dtype
-    past_length = 0
-    key_length = past_length + query_length
-    query_pos = cache_position.view(query_length, 1)
-    key_pos = torch.arange(key_length, device=device).view(1, key_length)
-    dist = query_pos - key_pos
-    window_mask = torch.zeros((query_length, key_length), device=device, dtype=dtype)
-    window_mask.masked_fill_(dist > sliding_window, torch.finfo(dtype).min)
-    window_mask = window_mask.unsqueeze(0).unsqueeze(0)
-    combined_mask = causal_mask + window_mask
-    return combined_mask
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
@@ -562,8 +538,17 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             "cache_position": cache_position,
         }
 
-        full_attn_mask = create_causal_mask(**mask_kwargs)
-        sliding_attn_mask = create_sliding_window_causal_mask(**mask_kwargs)
+        full_attn_mask = create_attention_mask(
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+        )
+        sliding_attn_mask = create_attention_mask(
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            sliding_window=self.config.sliding_window,
+        )
 
         # embed positions
         hidden_states = inputs_embeds
