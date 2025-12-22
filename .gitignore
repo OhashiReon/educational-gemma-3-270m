@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Model weights and Hugging Face cache
+*.safetensors
+*.pt
+*.pth
+.cache/
+.cache/huggingface
+.hf
+model_weights/
+
+# Editor / env
+.vscode/
+.env

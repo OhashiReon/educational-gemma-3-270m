@@ -2,7 +2,7 @@ import copy
 import functools
 import json
 from dataclasses import dataclass
-from typing import List, Optional, cast
+from typing import List, Optional, cast, Callable
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,12 @@ from huggingface_hub import hf_hub_download
 
 @dataclass
 class Gemma3TextConfig:
+    """Configuration for the Gemma3 text model.
+
+    Contains vocabulary and model dimension settings, attention parameters,
+    positional embedding/RoPE configuration, token IDs, and initialization options.
+    """
+
     vocab_size: int
     hidden_size: int
     intermediate_size: int
@@ -51,7 +57,8 @@ class Gemma3TextConfig:
         cls, repo_id: str, attn_implementation: str = "eager"
     ) -> "Gemma3TextConfig":
         """
-        config.json を読み込み、attn_implementation を注入してクラスを作成します。
+        Load config.json, inject `attn_implementation`, and construct the
+        config object.
         """
         config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
 
@@ -66,19 +73,23 @@ class Gemma3TextConfig:
 
 
 class Gemma3PreTrainedModel(nn.Module):
+    """Minimal base class that replaces transformers.PreTrainedModel.
+
+    Provides a lightweight base without an external dependency on Hugging Face
+    Transformers and supplies common utilities used by Gemma3 model classes.
     """
-    transformers.PreTrainedModel の代わりとなる、
-    依存関係を排除した最小限のベースクラス。
-    """
+
+    config: Gemma3TextConfig
 
     def __init__(self, config: Gemma3TextConfig):
         super().__init__()
-        self.config = config
+        self.config: Gemma3TextConfig = config
 
     def _init_weights(self, module):
         """
-        Gemmaモデルの標準的な初期化ロジック。
-        transformersのソースコードから、Gemmaに必要な部分のみを抽出・再現。
+        Standard weight initialization logic for Gemma models.
+        Extracted and reproduced only the parts required for Gemma from the
+        Transformers source code.
         """
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
@@ -92,15 +103,16 @@ class Gemma3PreTrainedModel(nn.Module):
 
     def post_init(self):
         """
-        __init__ の最後に呼び出して、全パラメータを初期化する。
-        ロード済みの重みを上書きしないよう、学習前の初期化時のみ重要になりますが、
-        load_state_dictする前段階の整合性として必要です。
+        Call at the end of __init__ to initialize all parameters.
+        This is mainly important before training to avoid overwriting loaded
+        weights, but it's required as a consistency step prior to calling
+        `load_state_dict`.
         """
         self.apply(self._init_weights)
 
     def tie_weights(self):
         """
-        入力埋め込みと出力層の重みを共有する場合の処理。
+        Handle weight sharing between input embeddings and the output layer.
         """
         output_embeddings = getattr(self, "lm_head", None)
         input_embeddings = getattr(self.model, "embed_tokens", None)
@@ -162,6 +174,8 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
     This module overrides nn.Embeddings' forward by multiplying with embeddings scale.
     """
 
+    embed_scale: torch.Tensor
+
     def __init__(
         self,
         num_embeddings: int,
@@ -172,16 +186,31 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
         super().__init__(num_embeddings, embedding_dim, padding_idx)
         self.register_buffer("embed_scale", torch.tensor(embed_scale), persistent=False)
 
-    def forward(self, input_ids: torch.Tensor):
-        return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        out = super().forward(input)
+        return out * self.embed_scale.to(self.weight.dtype)
 
 
 class Gemma3RotaryEmbedding(nn.Module):
+    """Rotary positional embedding (RoPE) helper with cached cos/sin values.
+
+    Computes and caches cosine and sine positional encodings based on the model
+    configuration so they can be quickly applied to query/key tensors.
+    """
+
+    dim: int
+    max_position_embeddings: int
+    base: float
+    inv_freq: torch.Tensor
+    max_seq_len_cached: int
+    cos_cached: torch.Tensor
+    sin_cached: torch.Tensor
+
     def __init__(self, config: Gemma3TextConfig, device=None):
         super().__init__()
-        self.dim = config.head_dim
-        self.max_position_embeddings = config.max_position_embeddings
-        self.base = config.rope_theta
+        self.dim: int = config.head_dim
+        self.max_position_embeddings: int = config.max_position_embeddings
+        self.base: float = config.rope_theta
         inv_freq = 1.0 / (
             self.base
             ** (
@@ -197,7 +226,7 @@ class Gemma3RotaryEmbedding(nn.Module):
         )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
+        self.max_seq_len_cached: int = seq_len
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=dtype)
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
@@ -217,10 +246,19 @@ class Gemma3RotaryEmbedding(nn.Module):
 
 
 class Gemma3RMSNorm(nn.Module):
+    """Root-mean-square layer normalization used in Gemma3.
+
+    Implements RMS normalization as used by Gemma architectures, with a
+    learnable scaling parameter and a small epsilon for numerical stability.
+    """
+
+    eps: float
+    weight: nn.Parameter
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
+        self.eps: float = eps
+        self.weight: nn.Parameter = nn.Parameter(torch.zeros(dim))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -237,11 +275,25 @@ class Gemma3RMSNorm(nn.Module):
 
 
 class Gemma3MLP(nn.Module):
+    """Feed-forward network (MLP) block used inside decoder layers.
+
+    Contains gated and projection linear layers and applies the configured
+    activation function to produce intermediate and output transformations.
+    """
+
+    config: Gemma3TextConfig
+    hidden_size: int
+    intermediate_size: int
+    gate_proj: nn.Linear
+    up_proj: nn.Linear
+    down_proj: nn.Linear
+    act_fn: "Callable[[torch.Tensor], torch.Tensor]"
+
     def __init__(self, config: Gemma3TextConfig):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.config: Gemma3TextConfig = config
+        self.hidden_size: int = config.hidden_size
+        self.intermediate_size: int = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
@@ -250,7 +302,9 @@ class Gemma3MLP(nn.Module):
                 nn.functional.gelu, approximate="tanh"
             ),
         }
-        self.act_fn = ACT2FN[config.hidden_activation]
+        self.act_fn: Callable[[torch.Tensor], torch.Tensor] = ACT2FN[
+            config.hidden_activation
+        ]
 
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -260,20 +314,37 @@ class Gemma3MLP(nn.Module):
 class Gemma3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+    is_sliding: bool
+    config: Gemma3TextConfig
+    layer_idx: int
+    head_dim: int
+    num_key_value_groups: int
+    scaling: float
+    attention_dropout: float
+    is_causal: bool
+    q_proj: nn.Linear
+    k_proj: nn.Linear
+    v_proj: nn.Linear
+    o_proj: nn.Linear
+    attn_logit_softcapping: Optional[float]
+    sliding_window: Optional[int]
+    q_norm: Gemma3RMSNorm
+    k_norm: Gemma3RMSNorm
+
     def __init__(self, config: Gemma3TextConfig, layer_idx: int):
         super().__init__()
-        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
-        self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = getattr(
+        self.is_sliding: bool = config.layer_types[layer_idx] == "sliding_attention"
+        self.config: Gemma3TextConfig = config
+        self.layer_idx: int = layer_idx
+        self.head_dim: int = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
-        self.num_key_value_groups = (
+        self.num_key_value_groups: int = (
             config.num_attention_heads // config.num_key_value_heads
         )
-        self.scaling = config.query_pre_attn_scalar**-0.5
-        self.attention_dropout = self.config.attention_dropout
-        self.is_causal = not self.config.use_bidirectional_attention
+        self.scaling: float = config.query_pre_attn_scalar**-0.5
+        self.attention_dropout: float = self.config.attention_dropout
+        self.is_causal: bool = not self.config.use_bidirectional_attention
 
         self.q_proj = nn.Linear(
             config.hidden_size,
@@ -295,8 +366,12 @@ class Gemma3Attention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
-        self.attn_logit_softcapping = self.config.attn_logit_softcapping
-        self.sliding_window = config.sliding_window if self.is_sliding else None
+        self.attn_logit_softcapping: Optional[float] = (
+            self.config.attn_logit_softcapping
+        )
+        self.sliding_window: Optional[int] = (
+            config.sliding_window if self.is_sliding else None
+        )
 
         self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
@@ -306,7 +381,7 @@ class Gemma3Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -364,7 +439,7 @@ class Gemma3Attention(nn.Module):
             attn_mask=attention_mask,
             dropout_p=dropout,
             scale=scaling,
-            is_causal=is_causal,
+            is_causal=bool(is_causal),
             enable_gqa=True,
         )
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -424,12 +499,29 @@ class Gemma3Attention(nn.Module):
 
 
 class Gemma3DecoderLayer(nn.Module):
+    """Single decoder layer combining attention, MLP, and normalization.
+
+    Each layer encapsulates self-attention (global or sliding), residual
+    connections, and feed-forward (MLP) sublayers with pre/post normalizations.
+    """
+
+    config: Gemma3TextConfig
+    hidden_size: int
+    layer_idx: int
+    attention_type: str
+    self_attn: Gemma3Attention
+    mlp: Gemma3MLP
+    input_layernorm: Gemma3RMSNorm
+    post_attention_layernorm: Gemma3RMSNorm
+    pre_feedforward_layernorm: Gemma3RMSNorm
+    post_feedforward_layernorm: Gemma3RMSNorm
+
     def __init__(self, config: Gemma3TextConfig, layer_idx: int):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.layer_idx = layer_idx
-        self.attention_type = config.layer_types[layer_idx]
+        self.config: Gemma3TextConfig = config
+        self.hidden_size: int = config.hidden_size
+        self.layer_idx: int = layer_idx
+        self.attention_type: str = config.layer_types[layer_idx]
         self.self_attn = Gemma3Attention(config=config, layer_idx=layer_idx)
         self.mlp = Gemma3MLP(config)
         self.input_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
@@ -480,42 +572,49 @@ class Gemma3DecoderLayer(nn.Module):
 
 
 class Gemma3TextModel(Gemma3PreTrainedModel):
+    """Transformer decoder stack for the Gemma3 text model.
+
+    Builds token embeddings, a sequence of decoder layers, and final
+    normalization to produce contextualized hidden states for LM heads.
+    """
+
     config: Gemma3TextConfig
+    padding_idx: int
+    vocab_size: int
+    embed_tokens: Gemma3TextScaledWordEmbedding
+    layers: nn.ModuleList
+    norm: Gemma3RMSNorm
+    rotary_emb: Gemma3RotaryEmbedding
+    gradient_checkpointing: bool
+    rotary_emb_local: Gemma3RotaryEmbedding
 
     def __init__(self, config: Gemma3TextConfig):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
+        self.padding_idx: int = config.pad_token_id
+        self.vocab_size: int = config.vocab_size
 
         # Gemma3 downcasts the below to bfloat16, causing sqrt(3072)=55.4256 to become 55.5. See https://github.com/huggingface/transformers/pull/29402
-        # 1. Embeddings
         self.embed_tokens = Gemma3TextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
             self.padding_idx,
             embed_scale=self.config.hidden_size**0.5,
         )
-
-        # 2. Layers
         self.layers = nn.ModuleList(
             [
                 Gemma3DecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-
-        # 3. Norm
         self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # 4. RoPE
         self.rotary_emb = Gemma3RotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
+        self.gradient_checkpointing: bool = False
         config = copy.deepcopy(config)
         config.rope_theta = config.rope_local_base_freq
         config.rope_scaling = {"rope_type": "default"}
         self.rotary_emb_local = Gemma3RotaryEmbedding(config=config)
 
-        # Initialize weights and apply final processing
         self.post_init()
 
     def forward(
@@ -544,14 +643,11 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             sliding_window=self.config.sliding_window,
         )
 
-        # embed positions
         hidden_states = inputs_embeds
 
-        # create position embeddings to be shared across the decoder layers
         position_embeddings_global = self.rotary_emb(hidden_states, position_ids)
         position_embeddings_local = self.rotary_emb_local(hidden_states, position_ids)
 
-        # decoder layers
         for decoder_layer in self.layers:
             decoder_layer = cast(Gemma3DecoderLayer, decoder_layer)
             if decoder_layer.attention_type == "sliding_attention":
@@ -572,13 +668,24 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
 
 
 class Gemma3ForCausalLM(Gemma3PreTrainedModel):
+    """Causal language modeling wrapper that adds an LM head.
+
+    Wraps the `Gemma3TextModel` and provides a linear language-modeling head
+    to project hidden states to vocabulary logits for causal generation.
+    """
+
+    model: Gemma3TextModel
+    vocab_size: int
+    lm_head: nn.Linear
+
     def __init__(self, config: Gemma3TextConfig):
         super().__init__(config)
-        self.model = Gemma3TextModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model: Gemma3TextModel = Gemma3TextModel(config)
+        self.vocab_size: int = config.vocab_size
+        self.lm_head: nn.Linear = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=False
+        )
 
-        # Initialize weights and apply final processing
         self.post_init()
 
     def forward(
@@ -586,7 +693,6 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs: torch.Tensor = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -596,24 +702,32 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel):
 
 
 if __name__ == "__main__":
-    import safetensors
+    from safetensors import torch as safetensors_torch
     import transformers
     from huggingface_hub import hf_hub_download
+    import torch.nn.functional as F
 
     tokenizer = transformers.AutoTokenizer.from_pretrained("google/gemma-3-270m")
     config = Gemma3TextConfig.from_pretrained("google/gemma-3-270m")
-    print(config)
-    print(config._attn_implementation)
     model = Gemma3ForCausalLM(config)
     weight_path = hf_hub_download(
         repo_id="google/gemma-3-270m", filename="model.safetensors"
     )
-    weight = safetensors.torch.load_file(weight_path)
+    weight = safetensors_torch.load_file(weight_path)
     model.load_state_dict(weight, strict=False)
     model.tie_weights()
     text = "Hello, my dog is cute"
-    for _ in range(20):
-        logits = model.forward(**tokenizer(text, return_tensors="pt"))
-        ids = logits[:, -1].argmax(-1)
-        text = text + tokenizer.decode(ids[0].unsqueeze(0))
-        print(text)
+    for step in range(20):
+        inputs = tokenizer(text, return_tensors="pt")
+        logits = model(**inputs)
+        next_logits = logits[:, -1, :]
+        probs = F.softmax(next_logits, dim=-1)
+        top_probs, top_ids = torch.topk(probs, 5, dim=-1)
+
+        print(f"\nStep {step}")
+        for p, tid in zip(top_probs[0], top_ids[0]):
+            token = tokenizer.decode([tid.item()])
+            print(f"  {token!r}: {p.item():.4f}")
+        next_id = top_ids[0, 0].unsqueeze(0)
+        text += tokenizer.decode(next_id)
+        print("Generated:", text)

@@ -1,0 +1,11 @@
+This repository contains code derived from the Hugging Face / Google ecosystem.
+
+Original authors and upstream projects:
+- Hugging Face Transformers (https://github.com/huggingface/transformers)
+- Google (original Gemma model sources referenced)
+
+These upstream components are licensed under the Apache License, Version 2.0.
+Modifications in this repository are Copyright 2025 OHASHI Reon (大橋 玲音).
+
+See LICENSE for license terms. Third-party model weights are NOT included in
+this repository; follow instructions in README to obtain them from upstream.
