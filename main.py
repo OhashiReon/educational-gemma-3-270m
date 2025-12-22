@@ -48,7 +48,7 @@ class Gemma3TextConfig:
 
     @classmethod
     def from_pretrained(
-        cls, repo_id: str, attn_implementation: str = "sdpa"
+        cls, repo_id: str, attn_implementation: str = "eager"
     ) -> "Gemma3TextConfig":
         """
         config.json を読み込み、attn_implementation を注入してクラスを作成します。
@@ -322,9 +322,9 @@ class Gemma3Attention(nn.Module):
             query_states, key_states, cos, sin
         )
 
-        # TODO: eager attention implementations
         ALL_ATTENTION_FUNCTIONS = {
             "sdpa": self.sdpa_attention_forward,
+            "eager": self.eager_attention_forward,
         }
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         attn_output, attn_weights = attention_interface(
@@ -367,6 +367,43 @@ class Gemma3Attention(nn.Module):
             is_causal=is_causal,
             enable_gqa=True,
         )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        return attn_output, None
+
+    def eager_attention_forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        dropout: float = 0.0,
+        scaling: Optional[float] = None,
+        is_causal: Optional[bool] = None,
+        sliding_window: Optional[int] = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, None]:
+        key = self.repeat_kv(key, self.num_key_value_groups)
+        value = self.repeat_kv(value, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query, key.transpose(-1, -2))
+        if scaling is not None:
+            attn_weights = attn_weights * scaling
+
+        if self.attn_logit_softcapping is not None:
+            attn_weights = self.attn_logit_softcapping * torch.tanh(
+                attn_weights / self.attn_logit_softcapping
+            )
+
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+
+        if dropout > 0.0:
+            attn_weights = torch.nn.functional.dropout(attn_weights, p=dropout)
+
+        attn_output = torch.matmul(attn_weights, value)
         attn_output = attn_output.transpose(1, 2).contiguous()
 
         return attn_output, None
