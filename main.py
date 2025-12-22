@@ -1,7 +1,6 @@
 import copy
 import functools
 import json
-import math
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -496,13 +495,6 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             device=inputs_embeds.device,
         )
         position_ids = cache_position.unsqueeze(0)
-
-        mask_kwargs = {
-            "config": self.config,
-            "input_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
-            "cache_position": cache_position,
-        }
 
         full_attn_mask = create_attention_mask(
             input_embeds=inputs_embeds,
