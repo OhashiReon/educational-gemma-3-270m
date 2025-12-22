@@ -109,11 +109,6 @@ class Gemma3PreTrainedModel(nn.Module):
             output_embeddings.weight = input_embeddings.weight
 
 
-ACT2FN = {
-    "gelu_pytorch_tanh": functools.partial(nn.functional.gelu, approximate="tanh"),
-}
-
-
 def create_attention_mask(
     *,
     input_embeds: torch.Tensor,
@@ -250,6 +245,11 @@ class Gemma3MLP(nn.Module):
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        ACT2FN = {
+            "gelu_pytorch_tanh": functools.partial(
+                nn.functional.gelu, approximate="tanh"
+            ),
+        }
         self.act_fn = ACT2FN[config.hidden_activation]
 
     def forward(self, x):
@@ -614,6 +614,6 @@ if __name__ == "__main__":
     text = "Hello, my dog is cute"
     for _ in range(20):
         logits = model.forward(**tokenizer(text, return_tensors="pt"))
-        ids = logits.argmax(-1)
-        text = text + tokenizer.decode(ids[0, -1].unsqueeze(0))
+        ids = logits[:, -1].argmax(-1)
+        text = text + tokenizer.decode(ids[0].unsqueeze(0))
         print(text)
