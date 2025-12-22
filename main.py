@@ -2,7 +2,7 @@ import copy
 import functools
 import json
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, cast
 
 import torch
 import torch.nn as nn
@@ -412,7 +412,6 @@ class Gemma3DecoderLayer(nn.Module):
         position_embeddings_global: torch.Tensor,
         position_embeddings_local: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -517,6 +516,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
 
         # decoder layers
         for decoder_layer in self.layers:
+            decoder_layer = cast(Gemma3DecoderLayer, decoder_layer)
             if decoder_layer.attention_type == "sliding_attention":
                 current_mask = sliding_attn_mask
             else:
@@ -527,7 +527,6 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
                 position_embeddings_global=position_embeddings_global,
                 position_embeddings_local=position_embeddings_local,
                 attention_mask=current_mask,
-                position_ids=position_ids,
             )
             hidden_states = layer_outputs
 
