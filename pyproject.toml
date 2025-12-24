@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "jaxtyping>=0.3.4",
     "torch>=2.9.1",
     "transformers>=4.57.3",
 ]
@@ -17,3 +18,9 @@ dev = [
     "ruff>=0.14.9",
     "ty>=0.0.1a34",
 ]
+
+[tool.ruff]
+# Per-file ignores for jaxtyping-related forward-annotation parsing issues.
+# Ignore F722 (syntax error in forward annotation) and F821 (undefined name)
+# only for files that intentionally use jaxtyping string shapes.
+per-file-ignores = { "main.py" = ["F722", "F821"] }
