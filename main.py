@@ -2,7 +2,7 @@ import copy
 import functools
 import json
 from dataclasses import dataclass
-from typing import List, Optional, cast, Callable
+from typing import Callable, List, Optional, Tuple, cast
 
 import torch
 import torch.nn as nn
@@ -457,7 +457,7 @@ class Gemma3Attention(nn.Module):
         is_causal: Optional[bool] = None,
         sliding_window: Optional[int] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, None]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         key = self.repeat_kv(key, self.num_key_value_groups)
         value = self.repeat_kv(value, self.num_key_value_groups)
 
@@ -481,7 +481,7 @@ class Gemma3Attention(nn.Module):
         attn_output = torch.matmul(attn_weights, value)
         attn_output = attn_output.transpose(1, 2).contiguous()
 
-        return attn_output, None
+        return attn_output, attn_weights
 
     @staticmethod
     def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -541,7 +541,7 @@ class Gemma3DecoderLayer(nn.Module):
         position_embeddings_global: torch.Tensor,
         position_embeddings_local: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -568,7 +568,7 @@ class Gemma3DecoderLayer(nn.Module):
 
         outputs = hidden_states
 
-        return outputs
+        return outputs, self_attn_weights
 
 
 class Gemma3TextModel(Gemma3PreTrainedModel):
@@ -621,7 +621,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor], Tuple[Optional[torch.Tensor]]]:
         inputs_embeds = self.embed_tokens(input_ids)
 
         cache_position = torch.arange(
@@ -644,7 +644,8 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
         )
 
         hidden_states = inputs_embeds
-
+        all_hidden_states = (hidden_states,)
+        all_self_attn_weights: Tuple[Optional[torch.Tensor], ...] = ()
         position_embeddings_global = self.rotary_emb(hidden_states, position_ids)
         position_embeddings_local = self.rotary_emb_local(hidden_states, position_ids)
 
@@ -655,16 +656,18 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             else:
                 current_mask = full_attn_mask
 
-            layer_outputs = decoder_layer(
+            layer_outputs, self_attn_weights = decoder_layer(
                 hidden_states,
                 position_embeddings_global=position_embeddings_global,
                 position_embeddings_local=position_embeddings_local,
                 attention_mask=current_mask,
             )
             hidden_states = layer_outputs
+            all_hidden_states = all_hidden_states + (hidden_states,)
+            all_self_attn_weights = all_self_attn_weights + (self_attn_weights,)
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+        return hidden_states, all_hidden_states, all_self_attn_weights
 
 
 class Gemma3ForCausalLM(Gemma3PreTrainedModel):
@@ -692,20 +695,23 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        outputs: torch.Tensor = self.model(
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor], Tuple[Optional[torch.Tensor]]]:
+        last_hidden_state: torch.Tensor
+        all_hidden_states: Tuple[torch.Tensor]
+        all_self_attn_weights: Tuple[Optional[torch.Tensor]]
+        last_hidden_state, all_hidden_states, all_self_attn_weights = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        logits = self.lm_head(outputs)
-        return logits
+        logits = self.lm_head(last_hidden_state)
+        return logits, all_hidden_states, all_self_attn_weights
 
 
 if __name__ == "__main__":
-    from safetensors import torch as safetensors_torch
+    import torch.nn.functional as F
     import transformers
     from huggingface_hub import hf_hub_download
-    import torch.nn.functional as F
+    from safetensors import torch as safetensors_torch
 
     tokenizer = transformers.AutoTokenizer.from_pretrained("google/gemma-3-270m")
     config = Gemma3TextConfig.from_pretrained("google/gemma-3-270m")
