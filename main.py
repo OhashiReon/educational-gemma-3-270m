@@ -156,10 +156,10 @@ def apply_rotary_pos_emb(
     k: Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
     cos: Annotated[Tensor, "Batch", "Seq", "HeadDim"],
     sin: Annotated[Tensor, "Batch", "Seq", "HeadDim"],
-    unsqueeze_dim: int = 2,
+    unsqueeze_dim: int = 1,
 ) -> tuple[
-    Annotated[Tensor, "Batch", "Heads", "Seq", "Dim"],
-    Annotated[Tensor, "Batch", "Heads", "Seq", "Dim"],
+    Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
+    Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
 ]:
     """
     q, k: [batch, heads, seq_len, head_dim]
@@ -305,7 +305,7 @@ class Gemma3MLP(nn.Module):
     gate_proj: nn.Linear
     up_proj: nn.Linear
     down_proj: nn.Linear
-    act_fn: "Callable[[Annotated[Tensor, 'Batch', 'Seq', 'Dim']], Annotated[Tensor, 'Batch', 'Seq', 'Dim']]"
+    act_fn: "Callable[[Annotated[Tensor, 'Batch', 'Seq', 'Intermediate']], Annotated[Tensor, 'Batch', 'Seq', 'Hidden']]"
 
     def __init__(self, config: Gemma3TextConfig):
         super().__init__()
@@ -321,8 +321,8 @@ class Gemma3MLP(nn.Module):
             ),
         }
         self.act_fn: Callable[
-            [Annotated[Tensor, "Batch", "Seq", "Hidden"]],
-            Annotated[Tensor, "Batch", "Seq", "Hidden"],
+            [Annotated[Tensor, "Batch", "Seq", "Intermediate"]],
+            Annotated[Tensor, "Batch", "Seq", "Intermediate"],
         ] = ACT2FN[config.hidden_activation]
 
     def forward(self, x):
@@ -453,7 +453,7 @@ class Gemma3Attention(nn.Module):
         is_causal: Optional[bool] = None,
         sliding_window: Optional[int] = None,
         **kwargs,
-    ) -> tuple[Annotated[Tensor, "Batch", "Seq", "Heads", "Dim"], None]:
+    ) -> tuple[Annotated[Tensor, "Batch", "Seq", "Heads", "HeadDim"], None]:
         key = self.repeat_kv(key, self.num_key_value_groups)
         value = self.repeat_kv(value, self.num_key_value_groups)
 
@@ -482,7 +482,7 @@ class Gemma3Attention(nn.Module):
         is_causal: Optional[bool] = None,
         sliding_window: Optional[int] = None,
         **kwargs,
-    ) -> tuple[Annotated[Tensor, "Batch", "Seq", "Heads", "Dim"], None]:
+    ) -> tuple[Annotated[Tensor, "Batch", "Seq", "Heads", "HeadDim"], None]:
         key = self.repeat_kv(key, self.num_key_value_groups)
         value = self.repeat_kv(value, self.num_key_value_groups)
 
@@ -510,8 +510,8 @@ class Gemma3Attention(nn.Module):
 
     @staticmethod
     def repeat_kv(
-        hidden_states: Annotated[Tensor, "Batch", "Heads", "Seq", "Dim"], n_rep: int
-    ) -> Annotated[Tensor, "Batch", "Heads*n_rep", "Seq", "Dim"]:
+        hidden_states: Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"], n_rep: int
+    ) -> Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"]:
         """
         This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
         num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
