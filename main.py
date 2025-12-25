@@ -305,7 +305,7 @@ class Gemma3MLP(nn.Module):
     gate_proj: nn.Linear
     up_proj: nn.Linear
     down_proj: nn.Linear
-    act_fn: "Callable[[Annotated[Tensor, 'Batch', 'Seq', 'Intermediate']], Annotated[Tensor, 'Batch', 'Seq', 'Hidden']]"
+    act_fn: "Callable[[Annotated[Tensor, 'Batch', 'Seq', 'Intermediate']], Annotated[Tensor, 'Batch', 'Seq', 'Intermediate']]"
 
     def __init__(self, config: Gemma3TextConfig):
         super().__init__()
@@ -402,10 +402,10 @@ class Gemma3Attention(nn.Module):
             Annotated[Tensor, "Batch", "Seq", "HeadDim"],
             Annotated[Tensor, "Batch", "Seq", "HeadDim"],
         ],
-        attention_mask: Optional[Annotated[Tensor, "Batch", 1, "Seq", "Seq"]],
+        attention_mask: Optional[Annotated[Tensor, "Batch", "Heads", "Seq", "Seq"]],
     ) -> tuple[
         Annotated[Tensor, "Batch", "Seq", "Hidden"],
-        Optional[Annotated[Tensor, "Batch", 1, "Query", "Key"]],
+        Optional[Annotated[Tensor, "Batch", "Heads", "Query", "Key"]],
     ]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -510,8 +510,9 @@ class Gemma3Attention(nn.Module):
 
     @staticmethod
     def repeat_kv(
-        hidden_states: Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"], n_rep: int
-    ) -> Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"]:
+        hidden_states: Annotated[Tensor, "Batch", "KeyValueHeads", "Seq", "HeadDim"],
+        n_rep: int,
+    ) -> Annotated[Tensor, "Batch", "AttentionHeads", "Seq", "HeadDim"]:
         """
         This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
         num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
@@ -652,7 +653,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[Annotated[Tensor, "Batch", "Seq"]] = None,
+        input_ids: Optional[Annotated[torch.LongTensor, "Batch", "Seq"]] = None,
         attention_mask: Optional[Annotated[Tensor, "Batch", "Seq"]] = None,
     ) -> Annotated[Tensor, "Batch", "Seq", "Hidden"]:
         inputs_embeds = self.embed_tokens(input_ids)
@@ -723,7 +724,7 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[Annotated[Tensor, "Batch", "Seq"]] = None,
+        input_ids: Optional[Annotated[torch.LongTensor, "Batch", "Seq"]] = None,
         attention_mask: Optional[Annotated[Tensor, "Batch", "Seq"]] = None,
     ) -> Annotated[Tensor, "Batch", "Seq", "Vocab"]:
         outputs: Annotated[Tensor, "Batch", "Seq", "Hidden"] = self.model(
