@@ -2,11 +2,12 @@ import copy
 import functools
 import json
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, cast
+from typing import Annotated, Callable, List, Optional, cast
 
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
+from torch import Tensor
 
 
 @dataclass
@@ -123,11 +124,11 @@ class Gemma3PreTrainedModel(nn.Module):
 
 def create_attention_mask(
     *,
-    input_embeds: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    cache_position: torch.Tensor,
+    input_embeds: Annotated[Tensor, "Batch", "Seq", "Hidden"],
+    attention_mask: Optional[Annotated[Tensor, "Batch", "Seq"]],
+    cache_position: Annotated[Tensor, "Seq"],
     sliding_window: Optional[int] = None,
-) -> torch.Tensor:
+) -> Annotated[Tensor, "Batch", 1, "Seq", "Seq"]:
     """
     Returns attention mask of shape (B, 1, Q, K)
     """
@@ -150,7 +151,16 @@ def create_attention_mask(
     return mask
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+def apply_rotary_pos_emb(
+    q: Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
+    k: Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
+    cos: Annotated[Tensor, "Batch", "Seq", "HeadDim"],
+    sin: Annotated[Tensor, "Batch", "Seq", "HeadDim"],
+    unsqueeze_dim: int = 1,
+) -> tuple[
+    Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
+    Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
+]:
     """
     q, k: [batch, heads, seq_len, head_dim]
     cos, sin: [batch, seq_len, head_dim] or [1, seq_len, head_dim]
@@ -162,7 +172,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-def rotate_half(x):
+def rotate_half(
+    x: Annotated[Tensor, "...", "HeadDim"],
+) -> Annotated[Tensor, "...", "HeadDim"]:
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -174,7 +186,7 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
     This module overrides nn.Embeddings' forward by multiplying with embeddings scale.
     """
 
-    embed_scale: torch.Tensor
+    embed_scale: Annotated[Tensor, ""]
 
     def __init__(
         self,
@@ -186,7 +198,9 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
         super().__init__(num_embeddings, embedding_dim, padding_idx)
         self.register_buffer("embed_scale", torch.tensor(embed_scale), persistent=False)
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input: Annotated[Tensor, "Batch", "Seq"]
+    ) -> Annotated[Tensor, "Batch", "Seq", "Hidden"]:
         out = super().forward(input)
         return out * self.embed_scale.to(self.weight.dtype)
 
@@ -260,10 +274,14 @@ class Gemma3RMSNorm(nn.Module):
         self.eps: float = eps
         self.weight: nn.Parameter = nn.Parameter(torch.zeros(dim))
 
-    def _norm(self, x):
+    def _norm(
+        self, x: Annotated[Tensor, "...", "Dim"]
+    ) -> Annotated[Tensor, "...", "Dim"]:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x):
+    def forward(
+        self, x: Annotated[Tensor, "...", "Dim"]
+    ) -> Annotated[Tensor, "...", "Dim"]:
         output = self._norm(x.float())
         # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
@@ -287,7 +305,7 @@ class Gemma3MLP(nn.Module):
     gate_proj: nn.Linear
     up_proj: nn.Linear
     down_proj: nn.Linear
-    act_fn: "Callable[[torch.Tensor], torch.Tensor]"
+    act_fn: "Callable[[Annotated[Tensor, 'Batch', 'Seq', 'Intermediate']], Annotated[Tensor, 'Batch', 'Seq', 'Intermediate']]"
 
     def __init__(self, config: Gemma3TextConfig):
         super().__init__()
@@ -302,9 +320,10 @@ class Gemma3MLP(nn.Module):
                 nn.functional.gelu, approximate="tanh"
             ),
         }
-        self.act_fn: Callable[[torch.Tensor], torch.Tensor] = ACT2FN[
-            config.hidden_activation
-        ]
+        self.act_fn: Callable[
+            [Annotated[Tensor, "Batch", "Seq", "Intermediate"]],
+            Annotated[Tensor, "Batch", "Seq", "Intermediate"],
+        ] = ACT2FN[config.hidden_activation]
 
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -378,10 +397,16 @@ class Gemma3Attention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        hidden_states: Annotated[Tensor, "Batch", "Seq", "Hidden"],
+        position_embeddings: tuple[
+            Annotated[Tensor, "Batch", "Seq", "HeadDim"],
+            Annotated[Tensor, "Batch", "Seq", "HeadDim"],
+        ],
+        attention_mask: Optional[Annotated[Tensor, "Batch", "Heads", "Seq", "Seq"]],
+    ) -> tuple[
+        Annotated[Tensor, "Batch", "Seq", "Hidden"],
+        Optional[Annotated[Tensor, "Batch", "Heads", "Query", "Key"]],
+    ]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -419,16 +444,16 @@ class Gemma3Attention(nn.Module):
 
     def sdpa_attention_forward(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
+        query: Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
+        key: Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
+        value: Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
+        attention_mask: Optional[Annotated[Tensor, "Batch", 1, "Seq", "Seq"]],
         dropout: float = 0.0,
         scaling: Optional[float] = None,
         is_causal: Optional[bool] = None,
         sliding_window: Optional[int] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, None]:
+    ) -> tuple[Annotated[Tensor, "Batch", "Seq", "Heads", "HeadDim"], None]:
         key = self.repeat_kv(key, self.num_key_value_groups)
         value = self.repeat_kv(value, self.num_key_value_groups)
 
@@ -448,16 +473,19 @@ class Gemma3Attention(nn.Module):
 
     def eager_attention_forward(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
+        query: Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
+        key: Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
+        value: Annotated[Tensor, "Batch", "Heads", "Seq", "HeadDim"],
+        attention_mask: Optional[Annotated[Tensor, "Batch", 1, "Query", "Key"]],
         dropout: float = 0.0,
         scaling: Optional[float] = None,
         is_causal: Optional[bool] = None,
         sliding_window: Optional[int] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        Annotated[Tensor, "Batch", "Seq", "Heads", "HeadDim"],
+        Annotated[Tensor, "Batch", "Heads", "Query", "Key"],
+    ]:
         key = self.repeat_kv(key, self.num_key_value_groups)
         value = self.repeat_kv(value, self.num_key_value_groups)
 
@@ -484,7 +512,10 @@ class Gemma3Attention(nn.Module):
         return attn_output, attn_weights
 
     @staticmethod
-    def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    def repeat_kv(
+        hidden_states: Annotated[Tensor, "Batch", "KeyValueHeads", "Seq", "HeadDim"],
+        n_rep: int,
+    ) -> Annotated[Tensor, "Batch", "AttentionHeads", "Seq", "HeadDim"]:
         """
         This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
         num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
@@ -537,11 +568,17 @@ class Gemma3DecoderLayer(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        position_embeddings_global: torch.Tensor,
-        position_embeddings_local: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        hidden_states: Annotated[Tensor, "Batch", "Seq", "Hidden"],
+        position_embeddings_global: tuple[
+            Annotated[Tensor, "Batch", "Seq", "HeadDim"],
+            Annotated[Tensor, "Batch", "Seq", "HeadDim"],
+        ],
+        position_embeddings_local: tuple[
+            Annotated[Tensor, "Batch", "Seq", "HeadDim"],
+            Annotated[Tensor, "Batch", "Seq", "HeadDim"],
+        ],
+        attention_mask: Optional[Annotated[Tensor, "Batch", 1, "Query", "Key"]] = None,
+    ) -> Annotated[Tensor, "Batch", "Seq", "Hidden"]:
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -568,7 +605,12 @@ class Gemma3DecoderLayer(nn.Module):
 
         outputs = hidden_states
 
-        return outputs, self_attn_weights
+        outputs = cast(Annotated[Tensor, "Batch", "Seq", "Hidden"], outputs)
+        self_attn_weights = cast(
+            Optional[Annotated[Tensor, "Batch", "Heads", "Query", "Key"]],
+            self_attn_weights,
+        )
+        return outputs
 
 
 class Gemma3TextModel(Gemma3PreTrainedModel):
@@ -619,9 +661,9 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor], Tuple[Optional[torch.Tensor]]]:
+        input_ids: Optional[Annotated[torch.LongTensor, "Batch", "Seq"]] = None,
+        attention_mask: Optional[Annotated[Tensor, "Batch", "Seq"]] = None,
+    ) -> Annotated[Tensor, "Batch", "Seq", "Hidden"]:
         inputs_embeds = self.embed_tokens(input_ids)
 
         cache_position = torch.arange(
@@ -645,7 +687,6 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
 
         hidden_states = inputs_embeds
         all_hidden_states = (hidden_states,)
-        all_self_attn_weights: Tuple[Optional[torch.Tensor], ...] = ()
         position_embeddings_global = self.rotary_emb(hidden_states, position_ids)
         position_embeddings_local = self.rotary_emb_local(hidden_states, position_ids)
 
@@ -656,7 +697,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             else:
                 current_mask = full_attn_mask
 
-            layer_outputs, self_attn_weights = decoder_layer(
+            layer_outputs = decoder_layer(
                 hidden_states,
                 position_embeddings_global=position_embeddings_global,
                 position_embeddings_local=position_embeddings_local,
@@ -664,10 +705,9 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             )
             hidden_states = layer_outputs
             all_hidden_states = all_hidden_states + (hidden_states,)
-            all_self_attn_weights = all_self_attn_weights + (self_attn_weights,)
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states, all_hidden_states, all_self_attn_weights
+        return hidden_states
 
 
 class Gemma3ForCausalLM(Gemma3PreTrainedModel):
@@ -693,18 +733,17 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor], Tuple[Optional[torch.Tensor]]]:
+        input_ids: Optional[Annotated[torch.LongTensor, "Batch", "Seq"]] = None,
+        attention_mask: Optional[Annotated[Tensor, "Batch", "Seq"]] = None,
+    ) -> Annotated[Tensor, "Batch", "Seq", "Vocab"]:
         last_hidden_state: torch.Tensor
-        all_hidden_states: Tuple[torch.Tensor]
-        all_self_attn_weights: Tuple[Optional[torch.Tensor]]
-        last_hidden_state, all_hidden_states, all_self_attn_weights = self.model(
+        last_hidden_state = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
+        last_hidden_state = cast(torch.Tensor, last_hidden_state)
         logits = self.lm_head(last_hidden_state)
-        return logits, all_hidden_states, all_self_attn_weights
+        return logits
 
 
 if __name__ == "__main__":

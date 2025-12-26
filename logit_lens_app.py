@@ -1,5 +1,6 @@
 import json
 from typing import Any
+from pathlib import Path
 
 import altair as alt
 import pandas as pd
@@ -8,18 +9,39 @@ import streamlit as st
 st.set_page_config(layout="wide")
 st.title("Logit Lens Explorer")
 
+DEFAULT_JSON_PATH = Path(__file__).parent / "out" / "logit_lens.json"
+print(DEFAULT_JSON_PATH)
+if not DEFAULT_JSON_PATH.exists():
+    json_file = st.file_uploader("Upload logit_lens.json", type=["json"])
+    if json_file is None:
+        st.warning("Please upload a JSON file or run 'logit_lens.py' to generate one.")
+        st.stop()
+    else:
+        data = json.load(json_file)
+else:
+    json_file_uploaded = st.file_uploader("Upload logit_lens.json", type=["json"])
+    with open(DEFAULT_JSON_PATH, "r", encoding="utf-8") as f:
+        json_file_default = f
+        data = json.load(json_file_default)
+    if json_file_uploaded is None:
+        st.info(
+            "Using default logit_lens.json from 'out' directory. if use upload your own file, please re-upload from the uploader above."
+        )
+        json_file = json_file_default
+    else:
+        st.info("Using uploaded logit_lens.json file.")
+        json_file = json_file_uploaded
+        data = json.load(json_file)
 
-json_file = st.file_uploader("Upload logit_lens.json", type=["json"])
-if json_file is None:
-    st.stop()
-
-data: dict[str, Any] = json.load(json_file)
 steps = data["steps"]
 
 
 step_idx = st.slider("Step", 0, len(steps) - 1, value=0)
 step = steps[step_idx]
-
+st.caption(
+    "Select a step for each generated token. "
+    "Moving the slider will show the internal state of the model at that point."
+)
 st.markdown("### Context")
 st.code(step["input_text"], language="text")
 st.markdown(f"**Generated token:** `{step['generated_token']['token']}`")
@@ -72,8 +94,11 @@ df["first_important_layer"] = df["token"].map(token_first_layer)
 df["first_layer_prob"] = df["token"].map(token_first_layer_prob)
 
 
-st.markdown("## Logit Lens Heatmap (Layers × Tokens)")
-
+st.markdown("## Logit Lens Heatmap")
+st.caption(
+    "The vertical axis represents the dominant token, the horizontal axis represents the layer, and the color represents the probability. "
+    "The tokens are sorted by the layer in which they first became dominant (highest ranked), so you can see at what stage the model started to predict what. "
+)
 token_sort_df = (
     df[["token", "first_important_layer", "first_layer_prob"]]
     .drop_duplicates()
@@ -101,16 +126,12 @@ heatmap = (
 
 st.altair_chart(heatmap, use_container_width=True)
 
+
+st.markdown("## Logit Lens Line Chart")
 st.caption(
-    "Tokens are sorted by: (1) the layer where they first appeared in TOP3, "
-    "(2) their probability in that layer (descending)."
+    "This visualizes how the probability of each token changes as the layers progress, and shows how the probability increases suddenly at certain layers."
 )
-
-
-st.markdown("## Probability Evolution Across Layers")
-
-TOP_N_LINES = 15
-line_tokens = sorted_tokens[:TOP_N_LINES]
+line_tokens = sorted_tokens[:]
 
 line_df = df[df["token"].isin(line_tokens)].copy()
 
@@ -128,11 +149,26 @@ line_chart = (
 
 st.altair_chart(line_chart, use_container_width=True)
 
-st.caption(f"Line chart shows top {TOP_N_LINES} tokens (same sort order as heatmap).")
+with st.expander("ℹ What is Logit Lens?"):
+    st.markdown("""
+    **Logit Lens** is a technique to visualize the internal "thought process" of a Transformer model.
+    
+    Normally, a model only converts its hidden state to a vocabulary probability distribution at the very last layer. 
+    Logit Lens applies this final conversion (using the explicit `lm_head` and `RMSNorm`) to the **intermediate hidden states** of every layer.
+    
+    - **Vertical Axis**: Tokens that ranked in the top probabilities.
+    - **Horizontal Axis**: The layer number (0 to Final).
+    - **Color**: The probability assigned to that token at that layer.
+    
+    This allows us to see *when* the model becomes confident about a specific token.
+                
+    see the [this article](https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens) for more details.
+
+    """)
 
 
 if data.get("final_attention") is not None:
-    st.markdown("## Attention Weights Visualization (All Layers × Heads)")
+    st.markdown("## Attention Weights Visualization")
 
     attention = data["final_attention"]
     tokens = attention["tokens"]
@@ -144,10 +180,6 @@ if data.get("final_attention") is not None:
     st.caption(
         f"Showing attention weights for all {num_layers} layers and {num_heads} heads"
     )
-
-    with st.expander("Show token list"):
-        token_df = pd.DataFrame({"index": range(len(tokens)), "token": tokens})
-        st.dataframe(token_df, use_container_width=True)
 
     for layer_idx in range(num_layers):
         st.markdown(f"### Layer {layer_idx}")
@@ -201,34 +233,13 @@ if data.get("final_attention") is not None:
 
         st.altair_chart(chart, use_container_width=True)
 
-
-st.markdown("## Per-layer Logit Lens (Raw Data)")
-
-st.caption(
-    "This table shows all important tokens tracked across all layers for the selected step."
-)
-
-display_df = df.copy()
-display_df["token"] = pd.Categorical(
-    display_df["token"], categories=sorted_tokens, ordered=True
-)
-display_df = display_df.sort_values(["token", "layer"])
-
-st.dataframe(
-    display_df[["token", "layer", "prob", "first_important_layer"]],
-    use_container_width=True,
-)
-
-
-st.markdown("## Statistics")
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.metric("Number of layers", df["layer"].nunique())
-
-with col2:
-    st.metric("Number of tracked tokens", df["token"].nunique())
-
-with col3:
-    st.metric("Total data points", len(df))
+with st.expander("ℹ️ What are Attention Weights?"):
+    st.markdown("""
+    **Self-Attention** is the mechanism allows the model to relate different positions of the input sequence to compute a representation of the sequence.
+    
+    - **Query (Y-axis)**: The token currently being processed.
+    - **Key (X-axis)**: The context tokens being attended to.
+    - **Color Intensity**: Represents the attention weight (importance). A higher weight means the model is "focusing" more on that Key token to produce the Query token's representation.
+    
+    Gemma 3 uses Multi-Head Attention, allowing it to focus on different aspects of relationships simultaneously (visualized here as separate grids per head).
+    """)

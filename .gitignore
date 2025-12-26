@@ -21,3 +21,6 @@ model_weights/
 # Editor / env
 .vscode/
 .env
+
+# output files
+out/
