@@ -1,8 +1,7 @@
 import json
 from dataclasses import asdict, dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set
 
-import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 import transformers
@@ -24,35 +23,29 @@ def load_model(repo_id: str):
 
 
 @dataclass
-class TokenProb:
+class TokenLayerProbs:
     token: str
     token_id: int
-    prob: float
+    layer_probs: List[float]
 
 
 @dataclass
-class LayerLogitLens:
-    layer: int
-    topk: List[TokenProb]
-
-
-@dataclass
-class FinalLogits:
-    topk: List[TokenProb]
+class AttentionWeights:
+    tokens: List[str]
+    weights: List[List[List[List[float]]]]
 
 
 @dataclass
 class GeneratedToken:
     token: str
-    token_id: int
+    token_id: int | float
 
 
 @dataclass
 class StepResult:
     step: int
     input_text: str
-    layers: List[LayerLogitLens]
-    final: FinalLogits
+    important_tokens: List[TokenLayerProbs]
     generated_token: GeneratedToken
 
 
@@ -60,19 +53,87 @@ class StepResult:
 class LogitLensResult:
     initial_text: str
     steps: List[StepResult]
+    final_attention: Optional[AttentionWeights] = None
 
 
-def topk_from_logits(logits: torch.Tensor, tokenizer, k: int) -> List[TokenProb]:
-    probs = F.softmax(logits, dim=-1)
-    top_probs, top_ids = torch.topk(probs, k, dim=-1)
-    return [
-        TokenProb(
-            token=tokenizer.decode([tid.item()]),
-            token_id=tid.item(),
-            prob=float(p.item()),
+def get_logits_for_all_layers(
+    model, hidden_states: List[torch.Tensor]
+) -> List[torch.Tensor]:
+    """各レイヤーのhidden stateからlogitsを計算"""
+    all_logits = []
+    for hidden_state in hidden_states:
+        x = hidden_state[:, -1:, :]
+        x = model.model.norm(x)
+        logits = model.lm_head(x)[:, -1, :]
+        all_logits.append(logits)
+    return all_logits
+
+
+def collect_important_token_ids(
+    all_logits: List[torch.Tensor], topk_per_layer: int
+) -> Set[int]:
+    """各レイヤーのTOPKに入るトークンIDを収集"""
+    important_ids = set()
+    for logits in all_logits:
+        probs = F.softmax(logits, dim=-1)
+        _, top_ids = torch.topk(probs, topk_per_layer, dim=-1)
+        important_ids.update(top_ids[0].tolist())
+    return important_ids
+
+
+def compute_token_layer_probs(
+    all_logits: List[torch.Tensor],
+    important_token_ids: Set[int],
+    tokenizer,
+) -> List[TokenLayerProbs]:
+    """重要トークンについて全レイヤーの確率を計算"""
+    results = []
+
+    for token_id in important_token_ids:
+        layer_probs = []
+        for logits in all_logits:
+            probs = F.softmax(logits, dim=-1)
+            prob = probs[0, token_id].item()
+            layer_probs.append(prob)
+
+        results.append(
+            TokenLayerProbs(
+                token=tokenizer.decode([token_id]),
+                token_id=token_id,
+                layer_probs=layer_probs,
+            )
         )
-        for p, tid in zip(top_probs[0], top_ids[0])
-    ]
+
+    results.sort(key=lambda x: x.layer_probs[-1], reverse=True)
+    return results
+
+
+def extract_attention_weights(
+    all_self_attn_weights: Tuple[torch.Tensor],
+    tokenizer,
+    text: str,
+    max_tokens: int = 30,
+    batch_idx: int = 0,
+) -> AttentionWeights:
+    """attention weightsをシリアライズ可能な形式に変換"""
+    tokens = tokenizer.tokenize(text)[:max_tokens]
+    T = len(tokens)
+
+    weights = []
+    for layer_idx in range(len(all_self_attn_weights)):
+        attn = all_self_attn_weights[layer_idx]
+        if isinstance(attn, torch.Tensor):
+            attn = attn.detach().cpu()
+
+        layer_weights = []
+        num_heads = attn.shape[1]
+        for head_idx in range(num_heads):
+            mat = attn[batch_idx, head_idx, :T, :T].tolist()
+            layer_weights.append(mat)
+
+        weights.append(layer_weights)
+
+    return AttentionWeights(tokens=tokens, weights=weights)
 
 
 def run_logit_lens(
@@ -81,44 +142,51 @@ def run_logit_lens(
     tokenizer,
     text: str,
     N: int,
-    topk: int,
-) -> Tuple[LogitLensResult, Tuple[Optional[torch.Tensor]], str]:
+    topk_per_layer: int = 3,
+    max_attention_tokens: int = 30,
+) -> Tuple[LogitLensResult, str]:
+    """
+    Args:
+        model: モデル
+        tokenizer: トークナイザー
+        text: 入力テキスト
+        N: 生成ステップ数
+        topk_per_layer: 各レイヤーで保存する上位K個のトークン数
+        max_attention_tokens: attention可視化用の最大トークン数
+    """
     steps: List[StepResult] = []
     current_text = text
+    final_attention = None
 
     for step_idx in range(N):
         inputs = tokenizer(current_text, return_tensors="pt")
         final_logits, all_hidden_states, all_self_attn_weights = model(**inputs)
 
-        layers: List[LayerLogitLens] = []
-        for layer_idx, hidden_state in enumerate(all_hidden_states):
-            x = hidden_state[:, -1:, :]
-            x = model.model.norm(x)
-            logits = model.lm_head(x)[:, -1, :]
-            layers.append(
-                LayerLogitLens(
-                    layer=layer_idx,
-                    topk=topk_from_logits(logits, tokenizer, topk),
-                )
-            )
+        all_logits = get_logits_for_all_layers(model, all_hidden_states)
 
-        final = FinalLogits(
-            topk=topk_from_logits(
-                final_logits[:, -1, :],
-                tokenizer,
-                topk,
-            )
+        important_token_ids = collect_important_token_ids(all_logits, topk_per_layer)
+
+        important_tokens = compute_token_layer_probs(
+            all_logits, important_token_ids, tokenizer
         )
 
-        next_id = final.topk[0].token_id
-        next_token = final.topk[0].token
+        if step_idx == N - 1:
+            final_attention = extract_attention_weights(
+                all_self_attn_weights,
+                tokenizer,
+                current_text,
+                max_tokens=max_attention_tokens,
+            )
+
+        final_probs = F.softmax(final_logits[:, -1, :], dim=-1)
+        next_id = torch.argmax(final_probs, dim=-1).item()
+        next_token = tokenizer.decode([next_id])
 
         steps.append(
             StepResult(
                 step=step_idx,
                 input_text=current_text,
-                layers=layers,
-                final=final,
+                important_tokens=important_tokens,
                 generated_token=GeneratedToken(
                     token=next_token,
                     token_id=next_id,
@@ -129,70 +197,25 @@ def run_logit_lens(
         current_text += next_token
 
     return (
-        LogitLensResult(initial_text=text, steps=steps),
-        all_self_attn_weights,
+        LogitLensResult(
+            initial_text=text, steps=steps, final_attention=final_attention
+        ),
         current_text,
     )
 
 
-def plot_attention_all_layers_heads_qk(
-    *,
-    all_self_attn_weights,
-    tokenizer,
-    text: str,
-    max_tokens: int = 30,
-    batch_idx: int = 0,
-):
-    tokens = tokenizer.tokenize(text)[:max_tokens]
-    T = len(tokens)
-
-    num_layers = len(all_self_attn_weights)
-    num_heads = all_self_attn_weights[0].shape[1]
-
-    fig, axes = plt.subplots(
-        num_layers,
-        num_heads,
-        figsize=(2.2 * num_heads, 2.2 * num_layers),
-        squeeze=False,
-    )
-
-    for layer_idx in range(num_layers):
-        attn = all_self_attn_weights[layer_idx]
-        if isinstance(attn, torch.Tensor):
-            attn = attn.detach().cpu()
-
-        for head_idx in range(num_heads):
-            ax = axes[layer_idx][head_idx]
-            mat = attn[batch_idx, head_idx, :T, :T]
-            ax.imshow(mat, cmap="viridis", vmin=0.0, vmax=1.0)
-            ax.set_xticks(range(T))
-            ax.set_yticks(range(T))
-            ax.set_xticklabels(tokens, rotation=90, fontsize=6)
-            ax.set_yticklabels(tokens, fontsize=6)
-            if layer_idx == 0:
-                ax.set_title(f"H{head_idx}", fontsize=9)
-            if head_idx == 0:
-                ax.set_ylabel(f"L{layer_idx}", fontsize=9)
-
-    plt.tight_layout()
-    plt.savefig("attention.png", dpi=300)
-
-
 if __name__ == "__main__":
     model, tokenizer = load_model("google/gemma-3-270m")
-    result, all_self_attn_weights, final_text = run_logit_lens(
+    result, final_text = run_logit_lens(
         model=model,
         tokenizer=tokenizer,
         text="Hello, my dog is cute",
         N=10,
-        topk=100,
+        topk_per_layer=3,
+        max_attention_tokens=30,
     )
 
     with open("logit_lens.json", "w", encoding="utf-8") as f:
         json.dump(asdict(result), f, ensure_ascii=False, indent=2)
 
-    plot_attention_all_layers_heads_qk(
-        all_self_attn_weights=all_self_attn_weights,
-        tokenizer=tokenizer,
-        text=final_text,
-    )
+    print(f"Generated text: {final_text}")
