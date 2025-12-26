@@ -46,6 +46,32 @@ uv run hf auth
 uv run python main.py
 ```
 
+## 内部状態の可視化（Logit Lens）
+
+このリポジトリには、**Logit Lens** の実装が含まれており、モデルが層を重ねるごとにどのように予測を洗練していくかを可視化できます。
+
+### 1. 解析データの生成
+
+解析スクリプトを実行して、隠れ状態およびアテンション重みをトレースします。
+これにより、`out/` ディレクトリに JSON ファイルが生成されます。
+
+```powershell
+uv run python logit_lens.py
+```
+
+### 2. エクスプローラの起動
+
+Streamlit アプリを起動し、生成されたデータを対話的に探索します。
+
+```powershell
+uv run streamlit run logit_lens_app.py
+```
+
+以下の内容を観察できます。
+
+* **Logit Lens**: 次トークンの確率が、レイヤーごとにどのように変化していくか
+* **Attention Weights**: 各レイヤー／各ヘッドにおいて、モデルがどのトークンに注意を向けているか
+
 ## 開発・貢献について
 
 Issue や PR は歓迎します。
