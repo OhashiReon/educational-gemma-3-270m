@@ -482,7 +482,10 @@ class Gemma3Attention(nn.Module):
         is_causal: Optional[bool] = None,
         sliding_window: Optional[int] = None,
         **kwargs,
-    ) -> tuple[Annotated[Tensor, "Batch", "Seq", "Heads", "HeadDim"], None]:
+    ) -> tuple[
+        Annotated[Tensor, "Batch", "Seq", "Heads", "HeadDim"],
+        Annotated[Tensor, "Batch", "Heads", "Query", "Key"],
+    ]:
         key = self.repeat_kv(key, self.num_key_value_groups)
         value = self.repeat_kv(value, self.num_key_value_groups)
 
@@ -506,7 +509,7 @@ class Gemma3Attention(nn.Module):
         attn_output = torch.matmul(attn_weights, value)
         attn_output = attn_output.transpose(1, 2).contiguous()
 
-        return attn_output, None
+        return attn_output, attn_weights
 
     @staticmethod
     def repeat_kv(
@@ -602,6 +605,11 @@ class Gemma3DecoderLayer(nn.Module):
 
         outputs = hidden_states
 
+        outputs = cast(Annotated[Tensor, "Batch", "Seq", "Hidden"], outputs)
+        self_attn_weights = cast(
+            Optional[Annotated[Tensor, "Batch", "Heads", "Query", "Key"]],
+            self_attn_weights,
+        )
         return outputs
 
 
@@ -678,7 +686,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
         )
 
         hidden_states = inputs_embeds
-
+        all_hidden_states = (hidden_states,)
         position_embeddings_global = self.rotary_emb(hidden_states, position_ids)
         position_embeddings_local = self.rotary_emb_local(hidden_states, position_ids)
 
@@ -696,6 +704,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
                 attention_mask=current_mask,
             )
             hidden_states = layer_outputs
+            all_hidden_states = all_hidden_states + (hidden_states,)
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -727,11 +736,13 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel):
         input_ids: Optional[Annotated[torch.LongTensor, "Batch", "Seq"]] = None,
         attention_mask: Optional[Annotated[Tensor, "Batch", "Seq"]] = None,
     ) -> Annotated[Tensor, "Batch", "Seq", "Vocab"]:
-        outputs: Annotated[Tensor, "Batch", "Seq", "Hidden"] = self.model(
+        last_hidden_state: torch.Tensor
+        last_hidden_state = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        logits = self.lm_head(outputs)
+        last_hidden_state = cast(torch.Tensor, last_hidden_state)
+        logits = self.lm_head(last_hidden_state)
         return logits
 
 
