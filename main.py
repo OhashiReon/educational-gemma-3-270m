@@ -482,7 +482,10 @@ class Gemma3Attention(nn.Module):
         is_causal: Optional[bool] = None,
         sliding_window: Optional[int] = None,
         **kwargs,
-    ) -> tuple[Annotated[Tensor, "Batch", "Seq", "Heads", "HeadDim"], None]:
+    ) -> tuple[
+        Annotated[Tensor, "Batch", "Seq", "Heads", "HeadDim"],
+        Annotated[Tensor, "Batch", "Heads", "Query", "Key"],
+    ]:
         key = self.repeat_kv(key, self.num_key_value_groups)
         value = self.repeat_kv(value, self.num_key_value_groups)
 
@@ -506,7 +509,7 @@ class Gemma3Attention(nn.Module):
         attn_output = torch.matmul(attn_weights, value)
         attn_output = attn_output.transpose(1, 2).contiguous()
 
-        return attn_output, None
+        return attn_output, attn_weights
 
     @staticmethod
     def repeat_kv(
@@ -678,7 +681,6 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
         )
 
         hidden_states = inputs_embeds
-
         position_embeddings_global = self.rotary_emb(hidden_states, position_ids)
         position_embeddings_local = self.rotary_emb_local(hidden_states, position_ids)
 

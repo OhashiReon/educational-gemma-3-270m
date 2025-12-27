@@ -52,6 +52,29 @@ Run the sample script (note: this requires a modest amount of VRAM):
 uv run python main.py
 ```
 
+## Visualizing Internal States (Logit Lens)
+
+This repository includes a Logit Lens implementation to visualize how the model refines its predictions layer by layer.
+
+### 1. Generate Analysis Data
+Run the analysis script to trace hidden states and attention weights. This creates a JSON file in the `out/` directory.
+
+```powershell
+uv run python logit_lens.py
+```
+
+### 2. Launch the Explorer
+Start the Streamlit app to explore the generated data interactively.
+
+```powershell
+uv run streamlit run logit_lens_app.py
+```
+
+You can observe:
+- **Logit Lens**: How the probability of the next token evolves across layers.
+- **Attention Weights**: Which tokens the model attends to at each layer/head.
+
+
 ## Development & Contributing
 
 Issues and pull requests are welcome.
