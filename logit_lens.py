@@ -186,29 +186,31 @@ def run_logit_lens_pipeline(repo_id: str, prompt: str, steps: int, topk_per_laye
 
     print(f"Starting generation: '{prompt}'")
 
-    with torch.no_grad():
-        for step_idx in range(steps):
-            inputs = tokenizer(current_text, return_tensors="pt")
-            logits = model(**inputs)
-            next_logits = logits[:, -1, :]
-            probs = F.softmax(next_logits, dim=-1)
-            next_id = torch.argmax(probs, dim=-1).item()
-            next_token = tokenizer.decode([next_id])
-            important_tokens = engine.compute_lens_at_step(topk=topk_per_layer)
-            step_results.append(
-                StepResult(
-                    step=step_idx,
-                    input_text=current_text,
-                    important_tokens=important_tokens,
-                    generated_token=GeneratedToken(next_token, int(next_id)),
+    try:
+        with torch.no_grad():
+            for step_idx in range(steps):
+                inputs = tokenizer(current_text, return_tensors="pt")
+                logits = model(**inputs)
+                next_logits = logits[:, -1, :]
+                probs = F.softmax(next_logits, dim=-1)
+                next_id = torch.argmax(probs, dim=-1).item()
+                next_token = tokenizer.decode([next_id])
+                important_tokens = engine.compute_lens_at_step(topk=topk_per_layer)
+                step_results.append(
+                    StepResult(
+                        step=step_idx,
+                        input_text=current_text,
+                        important_tokens=important_tokens,
+                        generated_token=GeneratedToken(next_token, int(next_id)),
+                    )
                 )
-            )
-            if step_idx == steps - 1:
-                final_attn = engine.extract_final_attention(current_text)
-            engine._clear_storage()
-            current_text += next_token
-            print(f"Step {step_idx + 1}/{steps}: {next_token!r}")
-    engine.remove_hooks()
+                if step_idx == steps - 1:
+                    final_attn = engine.extract_final_attention(current_text)
+                engine._clear_storage()
+                current_text += next_token
+                print(f"Step {step_idx + 1}/{steps}: {next_token!r}")
+    finally:
+        engine.remove_hooks()
     return LogitLensResult(
         initial_text=prompt, steps=step_results, final_attention=final_attn
     ), current_text

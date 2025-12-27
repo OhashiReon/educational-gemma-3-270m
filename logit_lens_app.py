@@ -9,28 +9,21 @@ st.set_page_config(layout="wide")
 st.title("Logit Lens Explorer")
 
 DEFAULT_JSON_PATH = Path(__file__).parent / "out" / "logit_lens.json"
-print(DEFAULT_JSON_PATH)
-if not DEFAULT_JSON_PATH.exists():
-    json_file = st.file_uploader("Upload logit_lens.json", type=["json"])
-    if json_file is None:
-        st.warning("Please upload a JSON file or run 'logit_lens.py' to generate one.")
-        st.stop()
-    else:
-        data = json.load(json_file)
-else:
-    json_file_uploaded = st.file_uploader("Upload logit_lens.json", type=["json"])
+
+json_file = st.file_uploader("Upload logit_lens.json", type=["json"])
+
+if json_file is not None:
+    st.info("Using uploaded logit_lens.json file.")
+    data = json.load(json_file)
+elif DEFAULT_JSON_PATH.exists():
+    st.info(
+        "Using default logit_lens.json from 'out' directory. Upload a file to override."
+    )
     with open(DEFAULT_JSON_PATH, "r", encoding="utf-8") as f:
-        json_file_default = f
-        data = json.load(json_file_default)
-    if json_file_uploaded is None:
-        st.info(
-            "Using default logit_lens.json from 'out' directory. if use upload your own file, please re-upload from the uploader above."
-        )
-        json_file = json_file_default
-    else:
-        st.info("Using uploaded logit_lens.json file.")
-        json_file = json_file_uploaded
-        data = json.load(json_file)
+        data = json.load(f)
+else:
+    st.warning("Please upload a JSON file or run 'logit_lens.py' to generate one.")
+    st.stop()
 
 steps = data["steps"]
 

@@ -605,11 +605,6 @@ class Gemma3DecoderLayer(nn.Module):
 
         outputs = hidden_states
 
-        outputs = cast(Annotated[Tensor, "Batch", "Seq", "Hidden"], outputs)
-        self_attn_weights = cast(
-            Optional[Annotated[Tensor, "Batch", "Heads", "Query", "Key"]],
-            self_attn_weights,
-        )
         return outputs
 
 
@@ -686,7 +681,6 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
         )
 
         hidden_states = inputs_embeds
-        all_hidden_states = (hidden_states,)
         position_embeddings_global = self.rotary_emb(hidden_states, position_ids)
         position_embeddings_local = self.rotary_emb_local(hidden_states, position_ids)
 
@@ -704,7 +698,6 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
                 attention_mask=current_mask,
             )
             hidden_states = layer_outputs
-            all_hidden_states = all_hidden_states + (hidden_states,)
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -736,13 +729,11 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel):
         input_ids: Optional[Annotated[torch.LongTensor, "Batch", "Seq"]] = None,
         attention_mask: Optional[Annotated[Tensor, "Batch", "Seq"]] = None,
     ) -> Annotated[Tensor, "Batch", "Seq", "Vocab"]:
-        last_hidden_state: torch.Tensor
-        last_hidden_state = self.model(
+        outputs: Annotated[Tensor, "Batch", "Seq", "Hidden"] = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        last_hidden_state = cast(torch.Tensor, last_hidden_state)
-        logits = self.lm_head(last_hidden_state)
+        logits = self.lm_head(outputs)
         return logits
 
 
