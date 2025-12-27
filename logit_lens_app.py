@@ -116,7 +116,7 @@ heatmap = (
     .properties(height=600)
 )
 
-st.altair_chart(heatmap, use_container_width=True)
+st.altair_chart(heatmap, width="stretch")
 
 
 st.markdown("## Logit Lens Line Chart")
@@ -139,7 +139,7 @@ line_chart = (
     .properties(height=300)
 )
 
-st.altair_chart(line_chart, use_container_width=True)
+st.altair_chart(line_chart, width="stretch")
 
 with st.expander("ℹ What is Logit Lens?"):
     st.markdown("""
@@ -223,7 +223,7 @@ if data.get("final_attention") is not None:
             stroke=None,
         )
 
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, width="stretch")
 
 with st.expander("ℹ️ What are Attention Weights?"):
     st.markdown("""
